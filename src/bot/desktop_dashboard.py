@@ -11,7 +11,7 @@ from tkinter import messagebox, ttk
 from .config import load_config
 from .dashboard_session import DashboardSessionController, SessionRunConfig, SessionStateSnapshot, SessionStopTargets
 from .env import load_dotenv_file
-from .iqoption_dashboard import DashboardSnapshot, IQOptionDashboardService, LocalSelectionView
+from .iqoption_dashboard import DashboardSnapshot, IQOptionDashboardService, LocalSelectionView, OpenPositionRow
 from .trade_journal import TradeJournalRepository
 
 
@@ -66,6 +66,8 @@ class DashboardWindow:
         self._recommended_var = tk.StringVar(value="-")
         self._session_var = tk.StringVar(value="STOPPED")
         self._checking_var = tk.StringVar(value="-")
+        self._open_positions_var = tk.StringVar(value="0")
+        self._block_reason_var = tk.StringVar(value="-")
 
         self._stake_var = tk.StringVar(value=preferences.get("stake_amount", "1.0"))
         self._timeframe_var = tk.StringVar(value=preferences.get("timeframe_sec", "60"))
@@ -129,6 +131,8 @@ class DashboardWindow:
         self._build_market_card(cards_row, width=110).pack(side=tk.LEFT, padx=(0, 12))
         self._build_info_card(cards_row, "Connection", self._connection_var, width=170).pack(side=tk.LEFT, padx=(0, 12))
         self._build_info_card(cards_row, "Run State", self._session_var, width=130).pack(side=tk.LEFT, padx=(0, 12))
+        self._build_info_card(cards_row, "Open Positions", self._open_positions_var, width=140).pack(side=tk.LEFT, padx=(0, 12))
+        self._build_info_card(cards_row, "Block Reason", self._block_reason_var, width=300).pack(side=tk.LEFT, padx=(0, 12))
         self._build_info_card(cards_row, "Checking", self._checking_var, width=300).pack(side=tk.LEFT, padx=(0, 12))
 
         secondary_cards = tk.Frame(top, bg="#f3efe6")
@@ -143,6 +147,7 @@ class DashboardWindow:
         self._login_button = ttk.Button(button_bar, text="Login", command=self.login)
         self._logout_button = ttk.Button(button_bar, text="Logout", command=self.logout)
         self._refresh_button = ttk.Button(button_bar, text="Refresh", command=self.refresh)
+        self._reconcile_button = ttk.Button(button_bar, text="Reconcile", command=self.reconcile_stale_trades)
         self._start_button = ttk.Button(button_bar, text="Start", command=self.start_session)
         self._stop_button = ttk.Button(button_bar, text="Stop", command=self.stop_session)
 
@@ -159,6 +164,7 @@ class DashboardWindow:
         self._build_controls_panel(left)
         self._build_checklist_panel(left)
         self._build_metrics_panel(right)
+        self._build_open_positions_panel(right)
         self._build_session_log_panel(right)
         self._build_history_panel(right)
 
@@ -301,6 +307,18 @@ class DashboardWindow:
             self._history_tree.column(key, width=width, anchor=anchor)
         self._history_tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
 
+    def _build_open_positions_panel(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        tk.Label(frame, text="Open Positions", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w", padx=14, pady=(14, 8))
+
+        columns = ("asset", "opened", "age", "expiry", "status", "broker")
+        self._open_positions_tree = ttk.Treeview(frame, columns=columns, show="headings", height=6)
+        for key, title, width, anchor in (("asset", "Pair", 120, "w"), ("opened", "Opened", 170, "w"), ("age", "Age", 90, "center"), ("expiry", "Expiry", 90, "center"), ("status", "Status", 100, "center"), ("broker", "Broker Ref", 180, "w")):
+            self._open_positions_tree.heading(key, text=title)
+            self._open_positions_tree.column(key, width=width, anchor=anchor)
+        self._open_positions_tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+
     def _build_session_log_panel(self, parent: tk.Widget) -> None:
         frame = tk.Frame(parent, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1)
         frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
@@ -358,6 +376,26 @@ class DashboardWindow:
         self._connection_var.set("CONNECTED" if self._service.is_connected() else "DISCONNECTED")
         self._sync_button_visibility()
         self._status_var.set(f"Loaded {len(snapshot.binary_pairs)} OTC pairs. Market={snapshot.market_status}. Opportunity scores refresh every 60s.")
+
+    def reconcile_stale_trades(self) -> None:
+        if not self._is_logged_in:
+            self._status_var.set("Login before reconciling stale trades.")
+            return
+        self._status_var.set("Reconciling stale trades...")
+        self._root.update_idletasks()
+        try:
+            summary = self._session_controller.reconcile_stale_trades()
+        except Exception as exc:
+            messagebox.showerror("Reconcile Error", f"{type(exc).__name__}: {exc}")
+            self._status_var.set(f"Reconcile failed: {type(exc).__name__}")
+            return
+        reason = (
+            f"inspected={summary.inspected_open_trades} | broker={summary.reconciled_from_broker} | "
+            f"closed={summary.closed_as_expired_unknown} | poll_failures={summary.poll_failures}"
+        )
+        self._append_session_log(asset="-", status="reconcile", reason=reason)
+        self.refresh()
+        self._status_var.set(f"Reconcile complete. {reason}")
 
     def start_session(self) -> None:
         if self._session_controller.is_running:
@@ -421,8 +459,11 @@ class DashboardWindow:
         self._apply_market_status_style(snapshot.market_status)
         self._asset_var.set(_join_assets(snapshot.selected_assets))
         self._recommended_var.set(_join_assets(tuple(pair.asset for pair in snapshot.recommended_pairs)))
+        self._open_positions_var.set(str(len(snapshot.open_positions)))
+        self._block_reason_var.set(snapshot.block_reason)
         self._render_checklist(snapshot)
         self._render_metric_cards(self._summary_grid, self._summary_labels, _summary_cards(snapshot.summary_metrics))
+        self._render_open_positions_rows(snapshot.open_positions)
         self._apply_local_selection_view(
             LocalSelectionView(
                 selected_assets=snapshot.selected_assets,
@@ -581,6 +622,7 @@ class DashboardWindow:
         self._set_button_visibility(self._start_button, visible=not is_running)
         self._set_button_visibility(self._stop_button, visible=is_running)
         self._refresh_button.configure(state=tk.NORMAL if self._is_logged_in else tk.DISABLED)
+        self._reconcile_button.configure(state=tk.NORMAL if self._is_logged_in and not is_running else tk.DISABLED)
         start_enabled = self._is_logged_in and self._login_mode_var.get().upper() == "PRACTICE"
         self._start_button.configure(state=tk.NORMAL if start_enabled else tk.DISABLED)
 
@@ -632,6 +674,7 @@ class DashboardWindow:
             (self._login_button, 0, 0),
             (self._logout_button, 0, 0),
             (self._refresh_button, 0, 1),
+            (self._reconcile_button, 0, 2),
             (self._start_button, 1, 0),
             (self._stop_button, 1, 0),
         )
@@ -676,6 +719,23 @@ class DashboardWindow:
             self._history_tree.delete(row_id)
         for trade in trades:
             self._history_tree.insert("", tk.END, values=(trade.asset, trade.opened_at_utc.replace("T", " ")[:19], trade.direction.upper(), trade.result, f"{trade.amount:.2f}", _format_money(trade.profit_loss_abs), _format_pct(trade.payout_snapshot)))
+
+    def _render_open_positions_rows(self, open_positions: tuple[OpenPositionRow, ...]) -> None:
+        for row_id in self._open_positions_tree.get_children():
+            self._open_positions_tree.delete(row_id)
+        for position in open_positions:
+            self._open_positions_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    position.asset,
+                    position.opened_at_utc.replace("T", " ")[:19],
+                    _format_age(position.age_sec),
+                    f"{position.expiry_sec}s",
+                    position.status,
+                    position.broker_reference or "-",
+                ),
+            )
 
 
 def _summary_cards(metrics) -> list[MetricCard]:
@@ -748,6 +808,16 @@ def _format_updated_at(value: str) -> str:
 
 def _format_clock(value: datetime) -> str:
     return value.astimezone().strftime("%H:%M:%S")
+
+
+def _format_age(age_sec: int) -> str:
+    minutes, seconds = divmod(max(age_sec, 0), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    if minutes > 0:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
 
 
 def load_dashboard_preferences(prefs_path: Path) -> dict[str, str]:

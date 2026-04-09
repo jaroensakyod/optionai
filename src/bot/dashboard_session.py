@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 import threading
 import time
@@ -10,14 +11,17 @@ from uuid import uuid4
 from .bot_runner import BotRunner, RunnerPlan
 from .config import AppConfig
 from .duplicate_guard import DuplicateSignalGuard
-from .iqoption_adapter import IQOptionAdapter
+from .iqoption_adapter import IQOptionAdapter, IQOptionAdapterError
 from .iqoption_market_data import IQOptionMarketDataProvider
 from .journal_service import JournalService
-from .models import InstrumentType
+from .models import InstrumentType, TradeResult
 from .runtime_logging import RuntimeEventLogger
 from .safety import StaleMarketDataGuard
 from .signal_engine import SimpleMomentumSignalEngine
 from .trade_journal import TradeJournalRepository
+
+
+_STALE_TRADE_GRACE_SEC = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +61,14 @@ class SessionStateSnapshot:
     last_trade_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ReconcileSummary:
+    inspected_open_trades: int
+    reconciled_from_broker: int
+    closed_as_expired_unknown: int
+    poll_failures: int
+
+
 class DashboardSessionController:
     def __init__(self, config: AppConfig, root_dir: Path):
         self._config = config
@@ -87,6 +99,22 @@ class DashboardSessionController:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def reconcile_stale_trades(self) -> ReconcileSummary:
+        repository = TradeJournalRepository.from_paths(self._root_dir / "data" / "trades.db", self._root_dir / "sql" / "001_initial_schema.sql")
+        journal_service = JournalService(repository)
+        broker_adapter = IQOptionAdapter.from_environment(self._config, repository, journal_service)
+        event_logger = RuntimeEventLogger(repository, self._config.runtime_log_dir, component="desktop_session")
+        try:
+            broker_adapter.connect()
+            return reconcile_open_practice_trades(
+                repository=repository,
+                journal_service=journal_service,
+                broker_adapter=broker_adapter,
+                event_logger=event_logger,
+            )
+        finally:
+            repository.close()
+
     def _run_session(
         self,
         session_id: str,
@@ -116,6 +144,12 @@ class DashboardSessionController:
             market_data_provider.connect()
             broker_adapter.connect()
             baseline_balance = broker_adapter.get_balance()
+            reconcile_open_practice_trades(
+                repository=repository,
+                journal_service=journal_service,
+                broker_adapter=broker_adapter,
+                event_logger=event_logger,
+            )
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status=None, baseline_balance=baseline_balance, status="running", last_reason=None, last_trade_id=None, target_mode=run_config.stop_targets.mode))
 
             while not self._stop_event.is_set():
@@ -172,6 +206,75 @@ class DashboardSessionController:
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="error", baseline_balance=baseline_balance, status="error", last_reason=type(exc).__name__, last_trade_id=None, target_mode=run_config.stop_targets.mode))
         finally:
             repository.close()
+
+
+def reconcile_open_practice_trades(
+    *,
+    repository: TradeJournalRepository,
+    journal_service: JournalService,
+    broker_adapter: IQOptionAdapter,
+    event_logger: RuntimeEventLogger,
+    now_utc: datetime | None = None,
+) -> ReconcileSummary:
+    current_time = now_utc or datetime.now(UTC)
+    inspected_open_trades = 0
+    reconciled_from_broker = 0
+    closed_as_expired_unknown = 0
+    poll_failures = 0
+    for trade in repository.list_trades(account_mode="PRACTICE"):
+        if trade.closed_at_utc is not None:
+            continue
+        inspected_open_trades += 1
+
+        age_sec = max((current_time - trade.opened_at_utc).total_seconds(), 0.0)
+        stale_after_sec = max(trade.expiry_sec, 0) + _STALE_TRADE_GRACE_SEC
+        if age_sec < stale_after_sec:
+            continue
+
+        try:
+            closed_trade = broker_adapter.poll_trade_result(trade.trade_id)
+        except (IQOptionAdapterError, TypeError, ValueError) as exc:
+            poll_failures += 1
+            event_logger.log(
+                severity="warning",
+                event_type="stale_trade_poll_failed",
+                message="Failed to poll an expired open trade during session reconciliation.",
+                details={"trade_id": trade.trade_id, "asset": trade.asset, "reason": str(exc)},
+            )
+            closed_trade = None
+
+        if closed_trade is not None:
+            reconciled_from_broker += 1
+            event_logger.log(
+                severity="info",
+                event_type="stale_trade_reconciled",
+                message="Resolved an expired open trade from broker state during session reconciliation.",
+                details={"trade_id": trade.trade_id, "asset": trade.asset, "result": closed_trade.result.value if closed_trade.result is not None else None},
+            )
+            continue
+
+        journal_service.close_trade(
+            trade_id=trade.trade_id,
+            result=TradeResult.EXPIRED_UNKNOWN,
+            profit_loss_abs=None,
+            profit_loss_pct_risk=None,
+            close_reason="stale_reconciliation",
+            error_code="STALE_OPEN_TRADE",
+            error_message="Trade remained open in the local journal past expiry and was closed during session reconciliation.",
+        )
+        closed_as_expired_unknown += 1
+        event_logger.log(
+            severity="warning",
+            event_type="stale_trade_closed",
+            message="Closed an expired open trade locally during session reconciliation.",
+            details={"trade_id": trade.trade_id, "asset": trade.asset, "age_sec": age_sec},
+        )
+    return ReconcileSummary(
+        inspected_open_trades=inspected_open_trades,
+        reconciled_from_broker=reconciled_from_broker,
+        closed_as_expired_unknown=closed_as_expired_unknown,
+        poll_failures=poll_failures,
+    )
 
 
 def check_stop_threshold(

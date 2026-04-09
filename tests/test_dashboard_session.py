@@ -6,7 +6,8 @@ import pytest
 from src.bot import dashboard_session
 from src.bot.bot_runner import BotRunResult
 from src.bot.config import RiskLimits
-from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, build_session_snapshot, check_stop_threshold
+from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, build_session_snapshot, check_stop_threshold, reconcile_open_practice_trades
+from src.bot.journal_service import JournalService
 from src.bot.market_data import Candle
 from src.bot.models import InstrumentType, StrategyVersion, TradeDirection, TradeJournalRecord, TradeResult
 from src.bot.trade_journal import TradeJournalRepository
@@ -188,6 +189,119 @@ def test_dashboard_session_checks_each_selected_asset_on_start(tmp_path, monkeyp
     assert updates[-1].status == "stopped"
 
 
+def test_reconcile_open_practice_trades_closes_unresolved_stale_trade(tmp_path) -> None:
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    opened_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
+    _seed_strategy_version(repository, strategy_version_id="session-stale", created_at=opened_at)
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="stale-trade",
+            signal_id=None,
+            strategy_version_id="session-stale",
+            opened_at_utc=opened_at,
+            closed_at_utc=None,
+            asset="AUDCAD-OTC",
+            instrument_type=InstrumentType.BINARY,
+            timeframe_sec=60,
+            direction=TradeDirection.CALL,
+            amount=1.0,
+            expiry_sec=60,
+            account_mode="PRACTICE",
+            broker_order_id="order-stale",
+            broker_position_id="position-stale",
+        )
+    )
+
+    class FakeBrokerAdapter:
+        def __init__(self) -> None:
+            self.polled_trade_ids: list[str] = []
+
+        def poll_trade_result(self, trade_id: str):
+            self.polled_trade_ids.append(trade_id)
+            raise ValueError("invalid broker identifier")
+
+    class FakeEventLogger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    broker_adapter = FakeBrokerAdapter()
+    event_logger = FakeEventLogger()
+
+    reconcile_open_practice_trades(
+        repository=repository,
+        journal_service=journal_service,
+        broker_adapter=broker_adapter,
+        event_logger=event_logger,
+        now_utc=datetime(2026, 4, 9, 12, 5, tzinfo=UTC),
+    )
+
+    updated_trade = repository.get_trade("stale-trade")
+    assert updated_trade is not None
+    assert updated_trade.closed_at_utc is not None
+    assert updated_trade.result == TradeResult.EXPIRED_UNKNOWN
+    assert updated_trade.close_reason == "stale_reconciliation"
+    assert updated_trade.error_code == "STALE_OPEN_TRADE"
+    assert broker_adapter.polled_trade_ids == ["stale-trade"]
+    assert [event["event_type"] for event in event_logger.events] == ["stale_trade_poll_failed", "stale_trade_closed"]
+    repository.close()
+
+
+def test_reconcile_open_practice_trades_leaves_fresh_trade_open(tmp_path) -> None:
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    opened_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
+    _seed_strategy_version(repository, strategy_version_id="session-fresh", created_at=opened_at)
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="fresh-trade",
+            signal_id=None,
+            strategy_version_id="session-fresh",
+            opened_at_utc=opened_at,
+            closed_at_utc=None,
+            asset="AUDCHF-OTC",
+            instrument_type=InstrumentType.BINARY,
+            timeframe_sec=60,
+            direction=TradeDirection.PUT,
+            amount=1.0,
+            expiry_sec=60,
+            account_mode="PRACTICE",
+            broker_order_id="654321",
+            broker_position_id="654321",
+        )
+    )
+
+    class FakeBrokerAdapter:
+        def poll_trade_result(self, _trade_id: str):
+            raise AssertionError("fresh trades should not be polled")
+
+    class FakeEventLogger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    event_logger = FakeEventLogger()
+
+    reconcile_open_practice_trades(
+        repository=repository,
+        journal_service=journal_service,
+        broker_adapter=FakeBrokerAdapter(),
+        event_logger=event_logger,
+        now_utc=datetime(2026, 4, 9, 12, 1, tzinfo=UTC),
+    )
+
+    updated_trade = repository.get_trade("fresh-trade")
+    assert updated_trade is not None
+    assert updated_trade.closed_at_utc is None
+    assert event_logger.events == []
+    repository.close()
+
+
 def _build_repository(tmp_path: Path) -> TradeJournalRepository:
     schema_path = Path(__file__).resolve().parents[1] / "sql" / "001_initial_schema.sql"
     return TradeJournalRepository.from_paths(tmp_path / "trades.db", schema_path)
@@ -220,17 +334,7 @@ def _seed_session_trade(
     asset: str = "EURUSD",
 ) -> None:
     created_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
-    repository.save_strategy_version(
-        StrategyVersion(
-            strategy_version_id=strategy_version_id,
-            created_at_utc=created_at,
-            strategy_name="desktop-session",
-            parameter_hash=strategy_version_id,
-            parameters={"surface": "desktop"},
-            created_by="test",
-            approval_status="approved",
-        )
-    )
+    _seed_strategy_version(repository, strategy_version_id=strategy_version_id, created_at=created_at)
     repository.upsert_trade(
         TradeJournalRecord(
             trade_id=trade_id,
@@ -249,5 +353,19 @@ def _seed_session_trade(
             payout_snapshot=0.8,
             profit_loss_abs=profit_loss_abs,
             profit_loss_pct_risk=profit_loss_abs,
+        )
+    )
+
+
+def _seed_strategy_version(repository: TradeJournalRepository, *, strategy_version_id: str, created_at: datetime) -> None:
+    repository.save_strategy_version(
+        StrategyVersion(
+            strategy_version_id=strategy_version_id,
+            created_at_utc=created_at,
+            strategy_name="desktop-session",
+            parameter_hash=strategy_version_id,
+            parameters={"surface": "desktop"},
+            created_by="test",
+            approval_status="approved",
         )
     )

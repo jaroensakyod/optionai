@@ -84,6 +84,9 @@ def test_dashboard_service_loads_open_binary_pairs_and_binary_metrics(tmp_path, 
     assert snapshot.selected_asset_metrics.wins == 1
     assert len(snapshot.recent_trades) == 2
     assert {trade.asset for trade in snapshot.recent_trades} == {"AUDCAD-OTC", "USDJPY-OTC"}
+    assert len(snapshot.open_positions) == 1
+    assert snapshot.open_positions[0].asset == "AUDCAD-OTC"
+    assert snapshot.block_reason == "max_open_positions_reached (1/1)"
     assert snapshot.binary_pairs[0].recommendation_reason is not None
     assert snapshot.binary_pairs[0].opportunity_score_pct > snapshot.binary_pairs[1].opportunity_score_pct
     assert 0.0 <= snapshot.binary_pairs[0].opportunity_score_pct <= 100.0
@@ -211,5 +214,23 @@ def _seed_binary_trades(repository: TradeJournalRepository) -> None:
             payout_snapshot=0.8,
             profit_loss_abs=0.8,
             profit_loss_pct_risk=0.8,
+        )
+    )
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="binary-open",
+            signal_id=None,
+            strategy_version_id="ui-v1",
+            opened_at_utc=opened_at,
+            closed_at_utc=None,
+            asset="AUDCAD-OTC",
+            instrument_type=InstrumentType.BINARY,
+            timeframe_sec=60,
+            direction=TradeDirection.CALL,
+            amount=1.0,
+            expiry_sec=60,
+            account_mode="PRACTICE",
+            broker_order_id="open-order-1",
+            broker_position_id="open-position-1",
         )
     )

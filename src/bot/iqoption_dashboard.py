@@ -46,6 +46,17 @@ class TradeHistoryRow:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenPositionRow:
+    trade_id: str
+    asset: str
+    opened_at_utc: str
+    age_sec: int
+    expiry_sec: int
+    broker_reference: str | None
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
 class DashboardSnapshot:
     account_mode: str
     balance: float
@@ -56,6 +67,8 @@ class DashboardSnapshot:
     summary_metrics: MetricSnapshot
     selected_asset_metrics: MetricSnapshot
     recent_trades: tuple[TradeHistoryRow, ...]
+    open_positions: tuple[OpenPositionRow, ...]
+    block_reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +173,8 @@ class IQOptionDashboardService:
         selected = _normalize_selected_assets(selected_assets, binary_pairs)
         binary_trades = self._list_binary_trades(selected_assets=None)
         selected_binary_trades = self._list_binary_trades(selected_assets=selected)
+        closed_selected_binary_trades = [trade for trade in selected_binary_trades if trade.closed_at_utc is not None]
+        open_positions = self._list_open_positions()
         recommended_pairs = tuple(pair for pair in binary_pairs if pair.is_recommended)[:3]
         return DashboardSnapshot(
             account_mode=self._selected_account_mode,
@@ -170,7 +185,9 @@ class IQOptionDashboardService:
             selected_assets=selected,
             summary_metrics=build_metric_snapshot(binary_trades),
             selected_asset_metrics=build_metric_snapshot(selected_binary_trades),
-            recent_trades=tuple(self._build_trade_history_rows(selected_binary_trades[-history_limit:])),
+            recent_trades=tuple(self._build_trade_history_rows(closed_selected_binary_trades[-history_limit:])),
+            open_positions=open_positions,
+            block_reason=self._build_block_reason(open_positions),
         )
 
     def list_open_binary_pairs(self) -> tuple[BinaryPairStatus, ...]:
@@ -209,10 +226,11 @@ class IQOptionDashboardService:
 
     def build_local_selection_view(self, *, selected_assets: tuple[str, ...], history_limit: int = 20) -> LocalSelectionView:
         selected_binary_trades = self._list_binary_trades(selected_assets=selected_assets)
+        closed_selected_binary_trades = [trade for trade in selected_binary_trades if trade.closed_at_utc is not None]
         return LocalSelectionView(
             selected_assets=selected_assets,
             selected_asset_metrics=build_metric_snapshot(selected_binary_trades),
-            recent_trades=tuple(self._build_trade_history_rows(selected_binary_trades[-history_limit:])),
+            recent_trades=tuple(self._build_trade_history_rows(closed_selected_binary_trades[-history_limit:])),
         )
 
     def _list_binary_trades(self, *, selected_assets: tuple[str, ...] | None) -> list[TradeJournalRecord]:
@@ -232,6 +250,44 @@ class IQOptionDashboardService:
             asset: build_metric_snapshot(self._list_binary_trades(selected_assets=(asset,)))
             for asset in assets
         }
+
+    def _list_open_positions(self) -> tuple[OpenPositionRow, ...]:
+        now_utc = datetime.now(UTC)
+        open_trades = [
+            trade
+            for trade in self._repository.list_trades(account_mode=self._selected_account_mode)
+            if trade.instrument_type == InstrumentType.BINARY and trade.closed_at_utc is None
+        ]
+        rows = [
+            OpenPositionRow(
+                trade_id=trade.trade_id,
+                asset=trade.asset,
+                opened_at_utc=trade.opened_at_utc.isoformat(),
+                age_sec=max(int((now_utc - trade.opened_at_utc).total_seconds()), 0),
+                expiry_sec=trade.expiry_sec,
+                broker_reference=trade.broker_position_id or trade.broker_order_id,
+                status="OPEN",
+            )
+            for trade in open_trades
+        ]
+        return tuple(sorted(rows, key=lambda row: row.opened_at_utc, reverse=True))
+
+    def _build_block_reason(self, open_positions: tuple[OpenPositionRow, ...]) -> str:
+        if len(open_positions) >= self._config.risk_limits.max_open_positions:
+            return (
+                f"max_open_positions_reached ({len(open_positions)}/{self._config.risk_limits.max_open_positions})"
+            )
+        for event in reversed(self._repository.list_system_events(component="desktop_session")):
+            reason = event.details.get("reason")
+            if event.event_type == "run_skipped" and isinstance(reason, str) and reason:
+                return reason
+            if event.event_type == "stale_market_data" and isinstance(reason, str) and reason:
+                return reason
+            if event.event_type in {"duplicate_signal_prevented", "no_signal", "entry_window_wait"}:
+                if isinstance(reason, str) and reason:
+                    return reason
+                return event.event_type
+        return "-"
 
     def _build_pair_status(
         self,

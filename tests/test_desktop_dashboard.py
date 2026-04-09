@@ -2,7 +2,7 @@ from pathlib import Path
 
 from datetime import UTC, datetime
 
-from src.bot.desktop_dashboard import _chance_band_colors, _format_clock, _format_updated_at, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
+from src.bot.desktop_dashboard import _chance_band_colors, _format_age, _format_clock, _format_updated_at, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
 
 
 def test_username_preference_round_trip(tmp_path: Path) -> None:
@@ -62,3 +62,9 @@ def test_format_updated_at_formats_iso_timestamp() -> None:
 
 def test_format_clock_formats_datetime() -> None:
     assert _format_clock(datetime(2026, 4, 10, 12, 34, 56, tzinfo=UTC))
+
+
+def test_format_age_formats_seconds_minutes_and_hours() -> None:
+    assert _format_age(45) == "45s"
+    assert _format_age(125) == "2m 5s"
+    assert _format_age(3660) == "1h 1m"
