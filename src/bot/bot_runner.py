@@ -83,7 +83,7 @@ class BotRunner:
             self._log_event("warning", "run_stopped", "Runner stopped by kill switch.", {"reason": self._kill_switch.reason})
             return BotRunResult(status="stopped", reason=self._kill_switch.reason or "kill_switch_active")
 
-        limit_reason = self._validate_limits(plan.stake_amount, current_time.date())
+        limit_reason = self._validate_limits(plan, current_time.date())
         if limit_reason is not None:
             self._log_event("warning", "run_skipped", "Runner skipped due to limits.", {"reason": limit_reason})
             return BotRunResult(status="skipped", reason=limit_reason)
@@ -200,18 +200,21 @@ class BotRunner:
         )
         self._repository.save_strategy_version(strategy_version)
 
-    def _validate_limits(self, stake_amount: float, today_utc: date) -> str | None:
+    def _validate_limits(self, plan: RunnerPlan, today_utc: date) -> str | None:
         limits = self._config.risk_limits
-        if stake_amount > limits.max_stake:
+        if plan.stake_amount > limits.max_stake:
             return "max_stake_exceeded"
 
-        open_positions = sum(
-            1
-            for trade in self._repository.list_trades(account_mode=self._config.app_mode)
-            if trade.closed_at_utc is None
-        )
-        if open_positions >= limits.max_open_positions:
-            return "max_open_positions_reached"
+        if limits.max_open_positions > 0:
+            open_positions_for_asset = sum(
+                1
+                for trade in self._repository.list_trades(account_mode=self._config.app_mode)
+                if trade.closed_at_utc is None
+                and trade.asset == plan.asset
+                and trade.instrument_type == plan.instrument_type
+            )
+            if open_positions_for_asset >= limits.max_open_positions:
+                return "open_position_for_asset_exists"
 
         if limits.max_daily_loss > 0 and self._realized_daily_pnl(today_utc) <= (-limits.max_daily_loss):
             return "max_daily_loss_reached"

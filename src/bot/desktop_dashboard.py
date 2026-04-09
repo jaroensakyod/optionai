@@ -144,10 +144,12 @@ class DashboardWindow:
         button_bar.grid_columnconfigure(0, minsize=98)
         button_bar.grid_columnconfigure(1, minsize=98)
         button_bar.grid_columnconfigure(2, minsize=98)
+        button_bar.grid_columnconfigure(3, minsize=98)
         self._login_button = ttk.Button(button_bar, text="Login", command=self.login)
         self._logout_button = ttk.Button(button_bar, text="Logout", command=self.logout)
         self._refresh_button = ttk.Button(button_bar, text="Refresh", command=self.refresh)
         self._reconcile_button = ttk.Button(button_bar, text="Reconcile", command=self.reconcile_stale_trades)
+        self._force_close_button = ttk.Button(button_bar, text="Force Close", command=self.force_close_open_trades)
         self._start_button = ttk.Button(button_bar, text="Start", command=self.start_session)
         self._stop_button = ttk.Button(button_bar, text="Stop", command=self.stop_session)
 
@@ -397,6 +399,24 @@ class DashboardWindow:
         self.refresh()
         self._status_var.set(f"Reconcile complete. {reason}")
 
+    def force_close_open_trades(self) -> None:
+        selected_trade_ids = tuple(self._open_positions_tree.selection()) if hasattr(self, "_open_positions_tree") else ()
+        close_scope = "selected open positions" if selected_trade_ids else "all open positions"
+        if not messagebox.askyesno("Force Close", f"Force close {close_scope} in the local journal?"):
+            return
+        self._status_var.set("Force closing open trades...")
+        self._root.update_idletasks()
+        try:
+            summary = self._session_controller.force_close_open_trades(selected_trade_ids or None)
+        except Exception as exc:
+            messagebox.showerror("Force Close Error", f"{type(exc).__name__}: {exc}")
+            self._status_var.set(f"Force close failed: {type(exc).__name__}")
+            return
+        reason = f"closed={summary.closed_count}"
+        self._append_session_log(asset="-", status="force_close", reason=reason)
+        self.refresh()
+        self._status_var.set(f"Force close complete. {reason}")
+
     def start_session(self) -> None:
         if self._session_controller.is_running:
             self._status_var.set("Session is already running.")
@@ -622,7 +642,8 @@ class DashboardWindow:
         self._set_button_visibility(self._start_button, visible=not is_running)
         self._set_button_visibility(self._stop_button, visible=is_running)
         self._refresh_button.configure(state=tk.NORMAL if self._is_logged_in else tk.DISABLED)
-        self._reconcile_button.configure(state=tk.NORMAL if self._is_logged_in and not is_running else tk.DISABLED)
+        self._reconcile_button.configure(state=tk.NORMAL if not is_running else tk.DISABLED)
+        self._force_close_button.configure(state=tk.NORMAL if not is_running else tk.DISABLED)
         start_enabled = self._is_logged_in and self._login_mode_var.get().upper() == "PRACTICE"
         self._start_button.configure(state=tk.NORMAL if start_enabled else tk.DISABLED)
 
@@ -675,6 +696,7 @@ class DashboardWindow:
             (self._logout_button, 0, 0),
             (self._refresh_button, 0, 1),
             (self._reconcile_button, 0, 2),
+            (self._force_close_button, 0, 3),
             (self._start_button, 1, 0),
             (self._stop_button, 1, 0),
         )
@@ -727,6 +749,7 @@ class DashboardWindow:
             self._open_positions_tree.insert(
                 "",
                 tk.END,
+                iid=position.trade_id,
                 values=(
                     position.asset,
                     position.opened_at_utc.replace("T", " ")[:19],

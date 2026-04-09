@@ -68,7 +68,7 @@ def test_bot_runner_submits_trade_from_csv_market_data(tmp_path, monkeypatch) ->
     repository.close()
 
 
-def test_bot_runner_skips_when_open_position_limit_reached(tmp_path, monkeypatch) -> None:
+def test_bot_runner_skips_when_same_asset_open_position_exists(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
     monkeypatch.setenv("BOT_MAX_OPEN_POSITIONS", "1")
     config = load_config(tmp_path)
@@ -103,7 +103,58 @@ def test_bot_runner_skips_when_open_position_limit_reached(tmp_path, monkeypatch
     second_result = runner.run_once(plan, now_utc=datetime(2026, 4, 9, 8, 4, tzinfo=UTC) + timedelta(minutes=1))
 
     assert first_result.status == "submitted"
-    assert second_result == BotRunResult(status="skipped", reason="max_open_positions_reached")
+    assert second_result == BotRunResult(status="skipped", reason="open_position_for_asset_exists")
+    repository.close()
+
+
+def test_bot_runner_allows_different_assets_to_open_at_same_time(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    monkeypatch.setenv("BOT_MAX_OPEN_POSITIONS", "1")
+    config = load_config(tmp_path)
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    market_data_csv = tmp_path / "candles.csv"
+    market_data_csv.write_text(
+        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price\n"
+        "2026-04-09T08:00:00+00:00,EURUSD,digital,60,1.1000,1.1010,1.0995,1.1008\n"
+        "2026-04-09T08:01:00+00:00,EURUSD,digital,60,1.1008,1.1020,1.1006,1.1017\n"
+        "2026-04-09T08:02:00+00:00,EURUSD,digital,60,1.1017,1.1030,1.1015,1.1026\n"
+        "2026-04-09T08:00:00+00:00,GBPUSD,digital,60,1.2000,1.2010,1.1995,1.2008\n"
+        "2026-04-09T08:01:00+00:00,GBPUSD,digital,60,1.2008,1.2020,1.2006,1.2017\n"
+        "2026-04-09T08:02:00+00:00,GBPUSD,digital,60,1.2017,1.2030,1.2015,1.2026\n",
+        encoding="utf-8",
+    )
+    runner = BotRunner(
+        config=config,
+        repository=repository,
+        journal_service=journal_service,
+        market_data_provider=CsvMarketDataProvider(market_data_csv),
+        signal_engine=SimpleMomentumSignalEngine(),
+        broker_adapter=PracticeBrokerAdapter(config, repository, journal_service),
+    )
+    first_plan = RunnerPlan(
+        strategy_version_id="runner-v1",
+        asset="EURUSD",
+        instrument_type=InstrumentType.DIGITAL,
+        timeframe_sec=60,
+        stake_amount=1.0,
+        expiry_sec=60,
+    )
+    second_plan = RunnerPlan(
+        strategy_version_id="runner-v1",
+        asset="GBPUSD",
+        instrument_type=InstrumentType.DIGITAL,
+        timeframe_sec=60,
+        stake_amount=1.0,
+        expiry_sec=60,
+    )
+
+    first_result = runner.run_once(first_plan, now_utc=datetime(2026, 4, 9, 8, 3, tzinfo=UTC))
+    second_result = runner.run_once(second_plan, now_utc=datetime(2026, 4, 9, 8, 3, tzinfo=UTC))
+
+    assert first_result.status == "submitted"
+    assert second_result.status == "submitted"
+    assert len(repository.list_trades(account_mode="PRACTICE")) == 2
     repository.close()
 
 

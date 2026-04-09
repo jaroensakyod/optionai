@@ -86,7 +86,7 @@ def test_dashboard_service_loads_open_binary_pairs_and_binary_metrics(tmp_path, 
     assert {trade.asset for trade in snapshot.recent_trades} == {"AUDCAD-OTC", "USDJPY-OTC"}
     assert len(snapshot.open_positions) == 1
     assert snapshot.open_positions[0].asset == "AUDCAD-OTC"
-    assert snapshot.block_reason == "max_open_positions_reached (1/1)"
+    assert snapshot.block_reason == "AUDCAD-OTC already has open order (1/1)"
     assert snapshot.binary_pairs[0].recommendation_reason is not None
     assert snapshot.binary_pairs[0].opportunity_score_pct > snapshot.binary_pairs[1].opportunity_score_pct
     assert 0.0 <= snapshot.binary_pairs[0].opportunity_score_pct <= 100.0

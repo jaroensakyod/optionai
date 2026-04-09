@@ -6,7 +6,7 @@ import pytest
 from src.bot import dashboard_session
 from src.bot.bot_runner import BotRunResult
 from src.bot.config import RiskLimits
-from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, build_session_snapshot, check_stop_threshold, reconcile_open_practice_trades
+from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, build_session_snapshot, check_stop_threshold, force_close_open_practice_trades, reconcile_open_practice_trades
 from src.bot.journal_service import JournalService
 from src.bot.market_data import Candle
 from src.bot.models import InstrumentType, StrategyVersion, TradeDirection, TradeJournalRecord, TradeResult
@@ -299,6 +299,57 @@ def test_reconcile_open_practice_trades_leaves_fresh_trade_open(tmp_path) -> Non
     assert updated_trade is not None
     assert updated_trade.closed_at_utc is None
     assert event_logger.events == []
+    repository.close()
+
+
+def test_force_close_open_practice_trades_closes_requested_rows(tmp_path) -> None:
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    opened_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
+    _seed_strategy_version(repository, strategy_version_id="session-force-close", created_at=opened_at)
+    for trade_id, asset in (("force-close-a", "AUDCAD-OTC"), ("force-close-b", "AUDCHF-OTC")):
+        repository.upsert_trade(
+            TradeJournalRecord(
+                trade_id=trade_id,
+                signal_id=None,
+                strategy_version_id="session-force-close",
+                opened_at_utc=opened_at,
+                closed_at_utc=None,
+                asset=asset,
+                instrument_type=InstrumentType.BINARY,
+                timeframe_sec=60,
+                direction=TradeDirection.CALL,
+                amount=1.0,
+                expiry_sec=60,
+                account_mode="PRACTICE",
+                broker_order_id=f"order-{trade_id}",
+                broker_position_id=f"position-{trade_id}",
+            )
+        )
+
+    class FakeEventLogger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    event_logger = FakeEventLogger()
+
+    summary = force_close_open_practice_trades(
+        repository=repository,
+        journal_service=journal_service,
+        event_logger=event_logger,
+        trade_ids=("force-close-a",),
+    )
+
+    trade_a = repository.get_trade("force-close-a")
+    trade_b = repository.get_trade("force-close-b")
+    assert summary.closed_count == 1
+    assert trade_a is not None and trade_a.result == TradeResult.CANCELLED
+    assert trade_a.close_reason == "forced_dashboard_close"
+    assert trade_b is not None and trade_b.closed_at_utc is None
+    assert [event["event_type"] for event in event_logger.events] == ["trade_force_closed"]
     repository.close()
 
 

@@ -273,10 +273,23 @@ class IQOptionDashboardService:
         return tuple(sorted(rows, key=lambda row: row.opened_at_utc, reverse=True))
 
     def _build_block_reason(self, open_positions: tuple[OpenPositionRow, ...]) -> str:
-        if len(open_positions) >= self._config.risk_limits.max_open_positions:
-            return (
-                f"max_open_positions_reached ({len(open_positions)}/{self._config.risk_limits.max_open_positions})"
+        if self._config.risk_limits.max_open_positions > 0:
+            open_counts_by_asset: dict[str, int] = {}
+            for position in open_positions:
+                open_counts_by_asset[position.asset] = open_counts_by_asset.get(position.asset, 0) + 1
+            blocking_asset = next(
+                (
+                    asset
+                    for asset, count in sorted(open_counts_by_asset.items())
+                    if count >= self._config.risk_limits.max_open_positions
+                ),
+                None,
             )
+            if blocking_asset is not None:
+                blocking_count = open_counts_by_asset[blocking_asset]
+                return (
+                    f"{blocking_asset} already has open order ({blocking_count}/{self._config.risk_limits.max_open_positions})"
+                )
         for event in reversed(self._repository.list_system_events(component="desktop_session")):
             reason = event.details.get("reason")
             if event.event_type == "run_skipped" and isinstance(reason, str) and reason:

@@ -69,6 +69,11 @@ class ReconcileSummary:
     poll_failures: int
 
 
+@dataclass(frozen=True, slots=True)
+class ForceCloseSummary:
+    closed_count: int
+
+
 class DashboardSessionController:
     def __init__(self, config: AppConfig, root_dir: Path):
         self._config = config
@@ -111,6 +116,20 @@ class DashboardSessionController:
                 journal_service=journal_service,
                 broker_adapter=broker_adapter,
                 event_logger=event_logger,
+            )
+        finally:
+            repository.close()
+
+    def force_close_open_trades(self, trade_ids: tuple[str, ...] | None = None) -> ForceCloseSummary:
+        repository = TradeJournalRepository.from_paths(self._root_dir / "data" / "trades.db", self._root_dir / "sql" / "001_initial_schema.sql")
+        journal_service = JournalService(repository)
+        event_logger = RuntimeEventLogger(repository, self._config.runtime_log_dir, component="desktop_session")
+        try:
+            return force_close_open_practice_trades(
+                repository=repository,
+                journal_service=journal_service,
+                event_logger=event_logger,
+                trade_ids=trade_ids,
             )
         finally:
             repository.close()
@@ -275,6 +294,39 @@ def reconcile_open_practice_trades(
         closed_as_expired_unknown=closed_as_expired_unknown,
         poll_failures=poll_failures,
     )
+
+
+def force_close_open_practice_trades(
+    *,
+    repository: TradeJournalRepository,
+    journal_service: JournalService,
+    event_logger: RuntimeEventLogger,
+    trade_ids: tuple[str, ...] | None = None,
+) -> ForceCloseSummary:
+    requested_trade_ids = set(trade_ids or ())
+    closed_count = 0
+    for trade in repository.list_trades(account_mode="PRACTICE"):
+        if trade.closed_at_utc is not None:
+            continue
+        if requested_trade_ids and trade.trade_id not in requested_trade_ids:
+            continue
+        journal_service.close_trade(
+            trade_id=trade.trade_id,
+            result=TradeResult.CANCELLED,
+            profit_loss_abs=None,
+            profit_loss_pct_risk=None,
+            close_reason="forced_dashboard_close",
+            error_code="FORCE_CLOSED",
+            error_message="Trade was force-closed from the desktop dashboard because no real broker order remained open.",
+        )
+        closed_count += 1
+        event_logger.log(
+            severity="warning",
+            event_type="trade_force_closed",
+            message="Force-closed an open practice trade from the desktop dashboard.",
+            details={"trade_id": trade.trade_id, "asset": trade.asset},
+        )
+    return ForceCloseSummary(closed_count=closed_count)
 
 
 def check_stop_threshold(
