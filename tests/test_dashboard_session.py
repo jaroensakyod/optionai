@@ -6,7 +6,7 @@ import pytest
 from src.bot import dashboard_session
 from src.bot.bot_runner import BotRunResult
 from src.bot.config import RiskLimits
-from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, build_session_snapshot, check_stop_threshold, force_close_open_practice_trades, reconcile_open_practice_trades
+from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, _chunk_assets, build_session_snapshot, check_stop_threshold, force_close_open_practice_trades, reconcile_open_practice_trades
 from src.bot.journal_service import JournalService
 from src.bot.market_data import Candle
 from src.bot.models import InstrumentType, StrategyVersion, TradeDirection, TradeJournalRecord, TradeResult
@@ -351,6 +351,10 @@ def test_force_close_open_practice_trades_closes_requested_rows(tmp_path) -> Non
     assert trade_b is not None and trade_b.closed_at_utc is None
     assert [event["event_type"] for event in event_logger.events] == ["trade_force_closed"]
     repository.close()
+
+
+def test_chunk_assets_returns_single_full_round_for_all_mode() -> None:
+    assert _chunk_assets(("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"), 0) == (("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"),)
 
 
 def _build_repository(tmp_path: Path) -> TradeJournalRepository:

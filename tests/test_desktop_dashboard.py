@@ -2,7 +2,7 @@ from pathlib import Path
 
 from datetime import UTC, datetime
 
-from src.bot.desktop_dashboard import _chance_band_colors, _format_age, _format_clock, _format_updated_at, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
+from src.bot.desktop_dashboard import _chance_band_colors, _format_age, _format_clock, _format_updated_at, _parse_batch_size, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
 
 
 def test_username_preference_round_trip(tmp_path: Path) -> None:
@@ -23,7 +23,7 @@ def test_dashboard_preferences_round_trip(tmp_path: Path) -> None:
             "login_account_mode": "REAL",
             "stake_amount": "2.5",
             "timeframe_sec": "120",
-            "batch_size": "1",
+            "batch_size": "ALL",
             "target_mode": "%",
         },
     )
@@ -33,7 +33,7 @@ def test_dashboard_preferences_round_trip(tmp_path: Path) -> None:
         "login_account_mode": "REAL",
         "stake_amount": "2.5",
         "timeframe_sec": "120",
-        "batch_size": "1",
+        "batch_size": "ALL",
         "target_mode": "%",
     }
 
@@ -68,3 +68,8 @@ def test_format_age_formats_seconds_minutes_and_hours() -> None:
     assert _format_age(45) == "45s"
     assert _format_age(125) == "2m 5s"
     assert _format_age(3660) == "1h 1m"
+
+
+def test_parse_batch_size_supports_all_and_numeric_values() -> None:
+    assert _parse_batch_size("ALL") == 0
+    assert _parse_batch_size("2") == 2

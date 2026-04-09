@@ -396,5 +396,7 @@ def build_session_snapshot(
 
 
 def _chunk_assets(assets: tuple[str, ...], batch_size: int) -> tuple[tuple[str, ...], ...]:
+    if batch_size <= 0:
+        return (assets,) if assets else ()
     normalized_batch_size = max(batch_size, 1)
     return tuple(tuple(assets[index : index + normalized_batch_size]) for index in range(0, len(assets), normalized_batch_size))

@@ -231,7 +231,7 @@ class DashboardWindow:
         self._add_labeled_entry(left_column, "Expiry sec", self._expiry_var)
         self._add_labeled_entry(right_column, "Poll sec", self._poll_var)
         self._add_combobox_entry(right_column, "Target mode", self._target_mode_var, values=("$", "%"), width=8)
-        self._add_combobox_entry(right_column, "Check per round", self._batch_size_var, values=("1", "2"), width=8)
+        self._add_combobox_entry(right_column, "Check per round", self._batch_size_var, values=("1", "2", "ALL"), width=8)
         self._add_labeled_entry(left_column, "Profit target", self._profit_target_var)
         self._add_labeled_entry(right_column, "Loss limit", self._loss_limit_var)
 
@@ -427,7 +427,7 @@ class DashboardWindow:
         try:
             run_config = SessionRunConfig(
                 assets=self._read_selected_assets(require_selection=True),
-                batch_size=int(self._batch_size_var.get()),
+                batch_size=_parse_batch_size(self._batch_size_var.get()),
                 stake_amount=float(self._stake_var.get()),
                 timeframe_sec=int(self._timeframe_var.get()),
                 expiry_sec=int(self._expiry_var.get()),
@@ -831,6 +831,13 @@ def _format_updated_at(value: str) -> str:
 
 def _format_clock(value: datetime) -> str:
     return value.astimezone().strftime("%H:%M:%S")
+
+
+def _parse_batch_size(value: str) -> int:
+    normalized = value.strip().upper()
+    if normalized == "ALL":
+        return 0
+    return int(normalized)
 
 
 def _format_age(age_sec: int) -> str:
