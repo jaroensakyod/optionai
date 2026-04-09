@@ -215,6 +215,49 @@ def test_practice_integration_harness_binary_order_probe_closes_trade(tmp_path, 
     repository.close()
 
 
+def test_practice_integration_harness_order_probe_reports_rejected_trade(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    config = load_config(tmp_path)
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    client = FakeRejectedIQClient("user@example.com", "secret")
+    broker_adapter = IQOptionAdapter(
+        config=config,
+        repository=repository,
+        journal_service=journal_service,
+        credentials=IQOptionCredentials(email="user@example.com", password="secret"),
+        client_factory=lambda email, password: client,
+    )
+    market_data_provider = IQOptionMarketDataProvider(
+        config=config,
+        credentials=IQOptionCredentials(email="user@example.com", password="secret"),
+        client_factory=lambda email, password: client,
+    )
+    broker_adapter.connect()
+    market_data_provider.connect()
+    logger = RuntimeEventLogger(repository, tmp_path / "runtime_logs", component="runner")
+    harness = PracticeIntegrationHarness(repository, market_data_provider, broker_adapter, event_logger=logger)
+
+    result = harness.run_order_probe(
+        asset="EURUSD-OTC",
+        instrument_type=InstrumentType.BINARY,
+        direction=TradeDirection.CALL,
+        timeframe_sec=60,
+        amount=1.0,
+        expiry_sec=60,
+        wait_for_close=True,
+        poll_interval_sec=0.01,
+        timeout_sec=1.0,
+    )
+
+    events = repository.list_system_events(component="runner")
+    assert result.status == "rejected"
+    assert result.result == "REJECTED"
+    assert result.reason == "BUY_FAILED"
+    assert any(event.event_type == "practice_order_probe_rejected" for event in events)
+    repository.close()
+
+
 def _build_repository(tmp_path: Path) -> TradeJournalRepository:
     schema_path = Path(__file__).resolve().parents[1] / "sql" / "001_initial_schema.sql"
     return TradeJournalRepository.from_paths(tmp_path / "trades.db", schema_path)
@@ -230,3 +273,8 @@ def _write_candles(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return csv_path
+
+
+class FakeRejectedIQClient(FakeIQFullClient):
+    def buy(self, amount: float, asset: str, action: str, duration: int):
+        return False, None

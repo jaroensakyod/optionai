@@ -199,7 +199,7 @@ No further parameter change is justified yet from the post-fix sample because:
 Full test suite result after the strategy change:
 
 ```text
-27 passed
+44 passed
 ```
 
 ## 30-second blitz exploration

@@ -1,8 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "copilot-assisted-iqoption-bot"
 version = "0.1.0"
 description = "Practice-mode trading research bot foundation with Copilot-assisted analysis workflows."
 requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+	"pytest>=8.4,<9",
+]
+iqoption = [
+	"websocket-client==0.56.0",
+	"iqoptionapi @ git+https://github.com/iqoptionapi/iqoptionapi.git@master",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

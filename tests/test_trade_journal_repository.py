@@ -84,3 +84,15 @@ def test_trade_repository_round_trip(tmp_path) -> None:
     assert len(practice_trades) == 1
 
     repository.close()
+
+
+def test_trade_repository_creates_parent_directory(tmp_path) -> None:
+    database_path = tmp_path / "nested" / "state" / "trades.db"
+    schema_path = Path(__file__).resolve().parents[1] / "sql" / "001_initial_schema.sql"
+
+    repository = TradeJournalRepository.from_paths(database_path, schema_path)
+
+    assert database_path.parent.exists()
+    assert database_path.exists()
+
+    repository.close()

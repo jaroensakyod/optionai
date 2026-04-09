@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from .iqoption_adapter import IQOptionAdapter
 from .iqoption_market_data import IQOptionMarketDataProvider
-from .models import InstrumentType, SessionLabel, SignalEvent, StrategyVersion, TradeDirection
+from .models import InstrumentType, SessionLabel, SignalEvent, StrategyVersion, TradeDirection, TradeResult
 from .runtime_logging import RuntimeEventLogger
 from .trade_journal import TradeJournalRepository
 
@@ -141,6 +141,25 @@ class PracticeIntegrationHarness:
             message="Practice order probe submitted.",
             details={"trade_id": trade.trade_id, "asset": asset, "instrument_type": instrument_type.value},
         )
+
+        if trade.result in {TradeResult.REJECTED, TradeResult.ERROR, TradeResult.CANCELLED}:
+            self._log(
+                severity="warning",
+                event_type="practice_order_probe_rejected",
+                message="Practice order probe was not accepted by the broker.",
+                details={
+                    "trade_id": trade.trade_id,
+                    "result": trade.result.value if trade.result is not None else None,
+                    "error_code": trade.error_code,
+                },
+            )
+            return PracticeOrderProbeResult(
+                status="rejected",
+                trade_id=trade.trade_id,
+                result=trade.result.value if trade.result is not None else None,
+                profit_loss_abs=trade.profit_loss_abs,
+                reason=trade.error_code or trade.error_message or "broker_rejected",
+            )
 
         if not wait_for_close:
             return PracticeOrderProbeResult(status="submitted", trade_id=trade.trade_id)

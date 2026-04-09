@@ -86,13 +86,13 @@
   - duplicate prevention and runtime event logging
   - practice smoke-test harness behavior with a fake client
   - practice binary OTC order probe behavior with a fake client
-- Latest local result: `27 passed`
+- Latest local result: `44 passed`
 
 ## Not Done Yet
 
 ### Real external dependency integration
 
-- Installed a `stable_api` compatible `iqoptionapi` fork in the workspace environment
+- Declared a repo-managed optional `.[iqoption]` dependency set for the `stable_api` compatible `iqoptionapi` GitHub fork plus `websocket-client==0.56.0`
 - Live practice-account connectivity has been attempted successfully for smoke-test scope
 - No handling has been added for manual 2FA beyond explicit blocking/error signaling
 - The practice smoke test passed in this workspace on 2026-04-09

@@ -21,9 +21,28 @@ What is working now:
 What has been validated locally:
 
 - Full pytest suite passes
-- Latest result: `27 passed`
+- Latest result: `44 passed`
 
 ## What you can use right now
+
+### Dependency install for this repo
+
+Install the base test and local-run dependencies with:
+
+```powershell
+python -m pip install -e .[dev]
+```
+
+Install the optional IQ Option path with:
+
+```powershell
+python -m pip install -e .[dev,iqoption]
+```
+
+Notes:
+
+- the supported IQ Option dependency is the community `stable_api` fork from GitHub, not the outdated PyPI `iqoptionapi` release
+- the extra pins `websocket-client==0.56.0` to match the upstream fork guidance
 
 ### Option 1: Run locally with CSV candles
 
@@ -107,9 +126,39 @@ This path is implemented and has now succeeded once in this workspace with a rea
 
 Current state:
 
-- `stable_api` compatible `iqoptionapi` fork is installed
+- `stable_api` compatible `iqoptionapi` fork is declared as an optional repo dependency via `.[iqoption]`
 - `.env` has been configured locally for this machine
 - broker connectivity, balance read, and candle fetch succeeded in practice mode
+
+Recommended preflight command:
+
+```powershell
+python -m src.bot.iqoption_sanity --env-file .env --asset EURUSD --instrument-type digital --timeframe-sec 60 --candle-limit 3
+```
+
+This returns a compact status line and exits non-zero if the dependency import is missing, credentials are still placeholders, or the bounded PRACTICE smoke check fails.
+
+### Desktop monitoring window
+
+There is now a local desktop dashboard for the bounded IQ Option practice path:
+
+```powershell
+python -m src.bot.desktop_dashboard
+```
+
+The window shows:
+
+- current PRACTICE balance
+- current account mode
+- checklist selection across open binary forex pairs with payout snapshots
+- recommended pairs based on payout and local binary win rate
+- selected-pair-group and overall binary win rate
+- login/logout controls for the PRACTICE session
+- start/stop controls for a bounded desktop runner session
+- stake, timeframe, expiry, poll interval, and `$`/`%` profit-loss targets
+- recent binary trade history from `data/trades.db`
+
+The pair list now comes from `get_all_profit()` instead of `get_all_open_time()`, which avoids the upstream `iqoptionapi` thread failure path that was throwing `KeyError: 'underlying'` during dashboard refresh.
 
 Command shape:
 

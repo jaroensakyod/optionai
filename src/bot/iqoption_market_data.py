@@ -117,7 +117,7 @@ class IQOptionMarketDataProvider:
             from iqoptionapi.stable_api import IQ_Option
         except ImportError as exc:  # pragma: no cover - depends on optional dependency
             raise IQOptionAdapterError(
-                "iqoptionapi is not installed. Install it explicitly before using IQOptionMarketDataProvider."
+                "iqoptionapi is not installed. Run 'python -m pip install -e .[iqoption]' before using IQOptionMarketDataProvider."
             ) from exc
         return IQ_Option(email, password)
 

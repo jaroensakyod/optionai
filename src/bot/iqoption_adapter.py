@@ -185,6 +185,8 @@ class IQOptionAdapter:
         trade = self._repository.get_trade(trade_id)
         if trade is None:
             raise IQOptionAdapterError(f"Unknown trade_id: {trade_id}")
+        if trade.closed_at_utc is not None and trade.result is not None:
+            return trade
         broker_id = trade.broker_position_id or trade.broker_order_id
         if broker_id is None:
             raise IQOptionAdapterError(f"Trade {trade_id} has no broker identifier recorded.")
@@ -240,7 +242,7 @@ class IQOptionAdapter:
             from iqoptionapi.stable_api import IQ_Option
         except ImportError as exc:  # pragma: no cover - depends on optional dependency
             raise IQOptionAdapterError(
-                "iqoptionapi is not installed. Install it explicitly before using IQOptionAdapter."
+                "iqoptionapi is not installed. Run 'python -m pip install -e .[iqoption]' before using IQOptionAdapter."
             ) from exc
         return IQ_Option(email, password)
 

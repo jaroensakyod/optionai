@@ -6,6 +6,7 @@
 - Added SQLite-backed trade journaling, metrics queries, structured runtime logging, and safety controls.
 - Added practice and IQ Option adapter boundaries so broker execution stays isolated from signal logic.
 - Added CLI, scheduler, duplicate prevention, and a multi-asset campaign runner.
+- Added repo-managed optional dependency setup for the IQ Option practice path.
 - Added automated tests for the runtime, journaling, metrics, scheduler, safety controls, and IQ Option boundaries.
 - Validated the workspace with local pytest runs and real practice-mode smoke and order-probe runs on 2026-04-09.
 
@@ -21,7 +22,7 @@
 
 ### Verified locally
 
-- Latest automated test status: `27 passed`.
+- Latest automated test status: `44 passed`.
 - IQ Option practice smoke test: passed.
 - Direct `EURUSD-OTC` practice order probe: completed end-to-end.
 - Strategy-path and campaign-path scheduler runs: exercised successfully in practice mode.
