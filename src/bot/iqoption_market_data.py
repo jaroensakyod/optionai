@@ -23,6 +23,7 @@ class IQOptionMarketDataProvider:
         if self.config.app_mode != "PRACTICE":
             raise ValueError("IQOptionMarketDataProvider is restricted to PRACTICE mode during MVP.")
         object.__setattr__(self, "_client", None)
+        object.__setattr__(self, "_unsupported_assets", set())
 
     @classmethod
     def from_environment(
@@ -67,6 +68,8 @@ class IQOptionMarketDataProvider:
     ) -> list[Candle]:
         if limit <= 0:
             return []
+        if asset in self._unsupported_assets:
+            return []
 
         raw_candles = self._get_candles_with_retry(asset=asset, timeframe_sec=timeframe_sec, limit=limit)
         candles = [
@@ -93,6 +96,10 @@ class IQOptionMarketDataProvider:
             try:
                 raw_candles = self._client.get_candles(asset, timeframe_sec, limit, time.time())
             except Exception as exc:
+                if _is_unsupported_asset_error(exc):
+                    logging.info("IQ Option does not support candles for %s: %s", asset, exc)
+                    self._unsupported_assets.add(asset)
+                    return []
                 last_error = exc
                 logging.warning("IQ Option candle fetch failed for %s on attempt %s: %s", asset, attempt + 1, exc)
                 self._force_reconnect()
@@ -100,12 +107,14 @@ class IQOptionMarketDataProvider:
             if raw_candles:
                 return raw_candles
 
-            logging.warning("IQ Option returned no candles for %s on attempt %s; reconnecting.", asset, attempt + 1)
+            logging.info("IQ Option returned no candles for %s on attempt %s; reconnecting.", asset, attempt + 1)
             self._force_reconnect()
 
+        logging.info("IQ Option marked %s as temporarily unsupported after repeated empty candle responses.", asset)
+        self._unsupported_assets.add(asset)
         if last_error is not None:
             raise IQOptionAdapterError(f"Unable to fetch candles for {asset} after reconnect attempts.") from last_error
-        raise IQOptionAdapterError(f"Unable to fetch candles for {asset}: broker returned no candle data.")
+        return []
 
     def _force_reconnect(self) -> None:
         object.__setattr__(self, "_client", None)
@@ -124,3 +133,8 @@ class IQOptionMarketDataProvider:
 
 def _to_datetime_utc(epoch_value: int | float) -> datetime:
     return datetime.fromtimestamp(float(epoch_value), tz=UTC)
+
+
+def _is_unsupported_asset_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "not found on consts" in message or "asset" in message and "consts" in message

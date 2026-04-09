@@ -6,7 +6,7 @@ import pytest
 from src.bot import dashboard_session
 from src.bot.bot_runner import BotRunResult
 from src.bot.config import RiskLimits
-from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, _chunk_assets, build_session_snapshot, check_stop_threshold, force_close_open_practice_trades, reconcile_open_practice_trades
+from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, _chunk_assets, _seconds_until_next_scan_window, build_session_snapshot, check_stop_threshold, force_close_open_practice_trades, reconcile_open_practice_trades
 from src.bot.journal_service import JournalService
 from src.bot.market_data import Candle
 from src.bot.models import InstrumentType, StrategyVersion, TradeDirection, TradeJournalRecord, TradeResult
@@ -355,6 +355,26 @@ def test_force_close_open_practice_trades_closes_requested_rows(tmp_path) -> Non
 
 def test_chunk_assets_returns_single_full_round_for_all_mode() -> None:
     assert _chunk_assets(("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"), 0) == (("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"),)
+
+
+def test_seconds_until_next_scan_window_starts_from_candle_close_boundary() -> None:
+    delay = _seconds_until_next_scan_window(
+        now_utc=datetime(2026, 4, 10, 12, 0, 30, tzinfo=UTC),
+        timeframe_sec=60,
+        poll_interval_sec=5.0,
+    )
+
+    assert delay == pytest.approx(35.0)
+
+
+def test_seconds_until_next_scan_window_rolls_to_next_candle_when_offset_passed() -> None:
+    delay = _seconds_until_next_scan_window(
+        now_utc=datetime(2026, 4, 10, 12, 1, 6, tzinfo=UTC),
+        timeframe_sec=60,
+        poll_interval_sec=5.0,
+    )
+
+    assert delay == pytest.approx(59.0)
 
 
 def _build_repository(tmp_path: Path) -> TradeJournalRepository:

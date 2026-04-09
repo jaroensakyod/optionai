@@ -55,6 +55,21 @@ class FlakyIQMarketClient(FakeIQMarketClient):
         return super().get_candles(asset, timeframe_sec, limit, end_from_time)
 
 
+class UnsupportedAssetIQMarketClient(FakeIQMarketClient):
+    def get_candles(self, asset: str, timeframe_sec: int, limit: int, end_from_time: float):
+        raise RuntimeError(f"Asset {asset} not found on consts")
+
+
+class EmptyCandleIQMarketClient(FakeIQMarketClient):
+    def __init__(self, email: str, password: str):
+        super().__init__(email, password)
+        self.fetch_calls = 0
+
+    def get_candles(self, asset: str, timeframe_sec: int, limit: int, end_from_time: float):
+        self.fetch_calls += 1
+        return []
+
+
 class FlakyReconnectable:
     def __init__(self, fail_times: int):
         self.fail_times = fail_times
@@ -126,6 +141,53 @@ def test_iqoption_market_data_provider_retries_after_candle_fetch_failure(tmp_pa
     assert len(clients) == 2
     assert clients[0].fetch_calls == 1
     assert candles[-1].close_price == 1.115
+
+
+def test_iqoption_market_data_provider_returns_empty_for_unsupported_asset(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    config = load_config(tmp_path)
+    provider = IQOptionMarketDataProvider(
+        config=config,
+        credentials=IQOptionCredentials(email="user@example.com", password="secret"),
+        client_factory=lambda email, password: UnsupportedAssetIQMarketClient(email, password),
+    )
+
+    candles = provider.get_recent_candles(
+        asset="EURCAD-OTC",
+        instrument_type=InstrumentType.BINARY,
+        timeframe_sec=60,
+        limit=3,
+    )
+
+    assert candles == []
+
+
+def test_iqoption_market_data_provider_marks_empty_asset_as_unsupported(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    config = load_config(tmp_path)
+    client = EmptyCandleIQMarketClient("user@example.com", "secret")
+    provider = IQOptionMarketDataProvider(
+        config=config,
+        credentials=IQOptionCredentials(email="user@example.com", password="secret"),
+        client_factory=lambda email, password: client,
+    )
+
+    first = provider.get_recent_candles(
+        asset="EURCAD-OTC",
+        instrument_type=InstrumentType.BINARY,
+        timeframe_sec=60,
+        limit=3,
+    )
+    second = provider.get_recent_candles(
+        asset="EURCAD-OTC",
+        instrument_type=InstrumentType.BINARY,
+        timeframe_sec=60,
+        limit=3,
+    )
+
+    assert first == []
+    assert second == []
+    assert client.fetch_calls == 3
 
 
 def test_stale_market_data_guard_skips_runner(tmp_path, monkeypatch) -> None:

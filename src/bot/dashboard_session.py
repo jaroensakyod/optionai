@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import threading
 import time
@@ -172,6 +172,7 @@ class DashboardSessionController:
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status=None, baseline_balance=baseline_balance, status="running", last_reason=None, last_trade_id=None, target_mode=run_config.stop_targets.mode))
 
             while not self._stop_event.is_set():
+                round_started_at = datetime.now(UTC)
                 for asset_batch in _chunk_assets(run_config.assets, run_config.batch_size):
                     if self._stop_event.is_set():
                         break
@@ -218,7 +219,15 @@ class DashboardSessionController:
                             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(last_asset,), current_asset=last_asset, last_run_status=last_result.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=last_result.trade_id, target_mode=run_config.stop_targets.mode))
                             return
 
-                    time.sleep(run_config.poll_interval_sec)
+                if self._stop_event.is_set():
+                    break
+
+                _sleep_until_next_scan_window(
+                    stop_event=self._stop_event,
+                    timeframe_sec=run_config.timeframe_sec,
+                    poll_interval_sec=run_config.poll_interval_sec,
+                    round_started_at=round_started_at,
+                )
 
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="stopped", baseline_balance=baseline_balance, status="stopped", last_reason="manual_stop", last_trade_id=None, target_mode=run_config.stop_targets.mode))
         except Exception as exc:
@@ -400,3 +409,29 @@ def _chunk_assets(assets: tuple[str, ...], batch_size: int) -> tuple[tuple[str, 
         return (assets,) if assets else ()
     normalized_batch_size = max(batch_size, 1)
     return tuple(tuple(assets[index : index + normalized_batch_size]) for index in range(0, len(assets), normalized_batch_size))
+
+
+def _sleep_until_next_scan_window(
+    *,
+    stop_event: threading.Event,
+    timeframe_sec: int,
+    poll_interval_sec: float,
+    round_started_at: datetime,
+) -> None:
+    delay_sec = _seconds_until_next_scan_window(
+        now_utc=round_started_at,
+        timeframe_sec=timeframe_sec,
+        poll_interval_sec=poll_interval_sec,
+    )
+    if delay_sec <= 0:
+        return
+    stop_event.wait(delay_sec)
+
+
+def _seconds_until_next_scan_window(*, now_utc: datetime, timeframe_sec: int, poll_interval_sec: float) -> float:
+    normalized_timeframe_sec = max(int(timeframe_sec), 1)
+    normalized_poll_sec = max(float(poll_interval_sec), 0.0)
+    epoch_sec = now_utc.timestamp()
+    timeframe_boundary_sec = ((int(epoch_sec) // normalized_timeframe_sec) + 1) * normalized_timeframe_sec
+    target_time_utc = datetime.fromtimestamp(timeframe_boundary_sec, tz=UTC) + timedelta(seconds=normalized_poll_sec)
+    return max((target_time_utc - now_utc).total_seconds(), 0.0)
