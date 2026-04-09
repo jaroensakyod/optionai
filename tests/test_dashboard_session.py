@@ -53,6 +53,7 @@ def test_build_session_snapshot_summarizes_closed_results(tmp_path) -> None:
         selected_assets=("EURUSD", "GBPUSD"),
         current_assets=("EURUSD",),
         current_asset="EURUSD",
+        last_run_status="skipped",
         baseline_balance=100.0,
         status="running",
         last_reason=None,
@@ -63,6 +64,7 @@ def test_build_session_snapshot_summarizes_closed_results(tmp_path) -> None:
     assert snapshot.closed_trades == 2
     assert snapshot.current_assets == ("EURUSD",)
     assert snapshot.current_asset == "EURUSD"
+    assert snapshot.last_run_status == "skipped"
     assert snapshot.wins == 1
     assert snapshot.losses == 1
     assert snapshot.net_pnl == pytest.approx(-0.2)

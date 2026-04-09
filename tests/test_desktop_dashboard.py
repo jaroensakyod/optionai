@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from src.bot.desktop_dashboard import _chance_band_colors, _format_updated_at, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
+from datetime import UTC, datetime
+
+from src.bot.desktop_dashboard import _chance_band_colors, _format_clock, _format_updated_at, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
 
 
 def test_username_preference_round_trip(tmp_path: Path) -> None:
@@ -56,3 +58,7 @@ def test_chance_band_colors_cover_all_zones() -> None:
 def test_format_updated_at_formats_iso_timestamp() -> None:
     assert _format_updated_at("2026-04-10T12:34:56+00:00")
     assert _format_updated_at("not-a-timestamp") == "not-a-timestamp"
+
+
+def test_format_clock_formats_datetime() -> None:
+    assert _format_clock(datetime(2026, 4, 10, 12, 34, 56, tzinfo=UTC))

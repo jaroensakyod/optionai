@@ -45,6 +45,7 @@ class SessionStateSnapshot:
     selected_assets: tuple[str, ...]
     current_assets: tuple[str, ...]
     current_asset: str | None
+    last_run_status: str | None
     closed_trades: int
     wins: int
     losses: int
@@ -115,7 +116,7 @@ class DashboardSessionController:
             market_data_provider.connect()
             broker_adapter.connect()
             baseline_balance = broker_adapter.get_balance()
-            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, baseline_balance=baseline_balance, status="running", last_reason=None, last_trade_id=None, target_mode=run_config.stop_targets.mode))
+            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status=None, baseline_balance=baseline_balance, status="running", last_reason=None, last_trade_id=None, target_mode=run_config.stop_targets.mode))
 
             while not self._stop_event.is_set():
                 for asset_batch in _chunk_assets(run_config.assets, run_config.batch_size):
@@ -123,7 +124,7 @@ class DashboardSessionController:
                         break
 
                     batch_label = " + ".join(asset_batch)
-                    on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=asset_batch, current_asset=batch_label, baseline_balance=baseline_balance, status="running", last_reason="checking_asset_batch", last_trade_id=None, target_mode=run_config.stop_targets.mode))
+                    on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=asset_batch, current_asset=batch_label, last_run_status="checking", baseline_balance=baseline_balance, status="running", last_reason="checking_asset_batch", last_trade_id=None, target_mode=run_config.stop_targets.mode))
 
                     batch_results: list[tuple[str, object]] = []
                     for asset in asset_batch:
@@ -141,7 +142,7 @@ class DashboardSessionController:
                             )
                         )
                         batch_results.append((asset, result))
-                        on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, baseline_balance=baseline_balance, status="running", last_reason=result.reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
+                        on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, last_run_status=result.status, baseline_balance=baseline_balance, status="running", last_reason=result.reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
 
                     for asset, result in batch_results:
                         if result.trade_id is None:
@@ -154,21 +155,21 @@ class DashboardSessionController:
 
                         threshold_reason = check_stop_threshold(repository=repository, strategy_version_id=session_id, baseline_balance=baseline_balance, targets=run_config.stop_targets)
                         if threshold_reason is not None:
-                            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
+                            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, last_run_status=result.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
                             return
 
                     if batch_results:
                         last_asset, last_result = batch_results[-1]
                         threshold_reason = check_stop_threshold(repository=repository, strategy_version_id=session_id, baseline_balance=baseline_balance, targets=run_config.stop_targets)
                         if threshold_reason is not None:
-                            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(last_asset,), current_asset=last_asset, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=last_result.trade_id, target_mode=run_config.stop_targets.mode))
+                            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(last_asset,), current_asset=last_asset, last_run_status=last_result.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=last_result.trade_id, target_mode=run_config.stop_targets.mode))
                             return
 
                     time.sleep(run_config.poll_interval_sec)
 
-            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, baseline_balance=baseline_balance, status="stopped", last_reason="manual_stop", last_trade_id=None, target_mode=run_config.stop_targets.mode))
+            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="stopped", baseline_balance=baseline_balance, status="stopped", last_reason="manual_stop", last_trade_id=None, target_mode=run_config.stop_targets.mode))
         except Exception as exc:
-            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, baseline_balance=baseline_balance, status="error", last_reason=type(exc).__name__, last_trade_id=None, target_mode=run_config.stop_targets.mode))
+            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="error", baseline_balance=baseline_balance, status="error", last_reason=type(exc).__name__, last_trade_id=None, target_mode=run_config.stop_targets.mode))
         finally:
             repository.close()
 
@@ -201,6 +202,7 @@ def build_session_snapshot(
     selected_assets: tuple[str, ...],
     current_assets: tuple[str, ...],
     current_asset: str | None,
+    last_run_status: str | None,
     baseline_balance: float,
     status: str,
     last_reason: str | None,
@@ -225,6 +227,7 @@ def build_session_snapshot(
         selected_assets=selected_assets,
         current_assets=current_assets,
         current_asset=current_asset,
+        last_run_status=last_run_status,
         closed_trades=closed_trades,
         wins=wins,
         losses=losses,

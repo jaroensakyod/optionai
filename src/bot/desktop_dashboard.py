@@ -24,6 +24,7 @@ class MetricCard:
 class DashboardWindow:
     _AUTO_REFRESH_MS = 60_000
     _CHECKLIST_CANVAS_WIDTH = 760
+    _MAX_SESSION_LOG_ROWS = 200
 
     def __init__(self, root: tk.Tk, service: IQOptionDashboardService, session_controller: DashboardSessionController, prefs_path: Path, dotenv_path: Path):
         self._root = root
@@ -38,6 +39,7 @@ class DashboardWindow:
         self._summary_labels: dict[str, tk.StringVar] = {}
         self._asset_labels: dict[str, tk.StringVar] = {}
         self._latest_snapshot: DashboardSnapshot | None = None
+        self._session_log_rows: list[tuple[str, str, str, str]] = []
         self._is_logged_in = False
         self._show_password = False
         self._password_entry: ttk.Entry | None = None
@@ -50,6 +52,7 @@ class DashboardWindow:
         self._scroll_frame: tk.Frame | None = None
         self._scroll_window_id: int | None = None
         self._auto_refresh_job: str | None = None
+        self._session_log_tree: ttk.Treeview | None = None
 
         preferences = load_dashboard_preferences(self._prefs_path)
         saved_username = preferences.get("last_username", "")
@@ -88,7 +91,7 @@ class DashboardWindow:
         self._int_validator = (self._root.register(_is_valid_int_input), "%P")
 
         self._build_layout()
-        self._login_mode_var.trace_add("write", lambda *_args: self._sync_button_visibility())
+        self._login_mode_var.trace_add("write", self._on_login_mode_changed)
         self._sync_button_visibility()
         self._schedule_auto_refresh()
 
@@ -156,6 +159,7 @@ class DashboardWindow:
         self._build_controls_panel(left)
         self._build_checklist_panel(left)
         self._build_metrics_panel(right)
+        self._build_session_log_panel(right)
         self._build_history_panel(right)
 
         tk.Label(self._root, textvariable=self._status_var, anchor="w", bg="#e2dccf", fg="#243027", padx=16, pady=8, font=("Segoe UI", 10)).pack(fill=tk.X, side=tk.BOTTOM)
@@ -195,26 +199,32 @@ class DashboardWindow:
         return card
 
     def _build_controls_panel(self, parent: tk.Widget) -> None:
-        frame = tk.Frame(parent, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1, padx=14, pady=12)
-        frame.pack(fill=tk.X)
-        columns = tk.Frame(frame, bg="#f8f5ee")
-        columns.pack(fill=tk.X)
-        left_column = tk.Frame(columns, bg="#f8f5ee")
-        left_column.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
-        right_column = tk.Frame(columns, bg="#f8f5ee")
-        right_column.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        shell = tk.Frame(parent, bg="#f3efe6")
+        shell.pack(fill=tk.X)
+        login_card = tk.Frame(shell, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1, padx=14, pady=12)
+        login_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 9))
+        trading_card = tk.Frame(shell, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1, padx=14, pady=12)
+        trading_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(9, 0))
 
-        self._add_text_entry(left_column, "Username", self._username_var)
-        self._add_text_entry(left_column, "Password", self._password_var, mask=True)
-        self._add_combobox_entry(left_column, "Login mode", self._login_mode_var, values=("PRACTICE", "REAL"), width=12)
+        tk.Label(login_card, text="Login", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w")
+        self._add_text_entry(login_card, "Username", self._username_var)
+        self._add_text_entry(login_card, "Password", self._password_var, mask=True)
+        self._add_combobox_entry(login_card, "Login mode", self._login_mode_var, values=("PRACTICE", "REAL"), width=12)
+
+        tk.Label(trading_card, text="Trading Controls", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w")
+        controls_grid = tk.Frame(trading_card, bg="#f8f5ee")
+        controls_grid.pack(fill=tk.X)
+        left_column = tk.Frame(controls_grid, bg="#f8f5ee")
+        left_column.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
+        right_column = tk.Frame(controls_grid, bg="#f8f5ee")
+        right_column.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._add_labeled_entry(left_column, "Stake / ไม้", self._stake_var)
         self._add_labeled_entry(left_column, "Timeframe sec", self._timeframe_var)
-
-        self._add_labeled_entry(right_column, "Expiry sec", self._expiry_var)
+        self._add_labeled_entry(left_column, "Expiry sec", self._expiry_var)
         self._add_labeled_entry(right_column, "Poll sec", self._poll_var)
         self._add_combobox_entry(right_column, "Target mode", self._target_mode_var, values=("$", "%"), width=8)
         self._add_combobox_entry(right_column, "Check per round", self._batch_size_var, values=("1", "2"), width=8)
-        self._add_labeled_entry(right_column, "Profit target", self._profit_target_var)
+        self._add_labeled_entry(left_column, "Profit target", self._profit_target_var)
         self._add_labeled_entry(right_column, "Loss limit", self._loss_limit_var)
 
     def _add_labeled_entry(self, parent: tk.Widget, label: str, variable: tk.StringVar) -> None:
@@ -291,6 +301,17 @@ class DashboardWindow:
             self._history_tree.column(key, width=width, anchor=anchor)
         self._history_tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
 
+    def _build_session_log_panel(self, parent: tk.Widget) -> None:
+        frame = tk.Frame(parent, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        tk.Label(frame, text="Session Log", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w", padx=14, pady=(14, 8))
+        columns = ("time", "asset", "status", "reason")
+        self._session_log_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        for key, title, width, anchor in (("time", "Time", 90, "w"), ("asset", "Pair", 180, "w"), ("status", "Status", 90, "center"), ("reason", "Reason", 220, "w")):
+            self._session_log_tree.heading(key, text=title)
+            self._session_log_tree.column(key, width=width, anchor=anchor)
+        self._session_log_tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+
     def login(self) -> None:
         try:
             self._service.update_credentials(email=self._username_var.get(), password=self._password_var.get())
@@ -300,6 +321,7 @@ class DashboardWindow:
             self._is_logged_in = True
             self._connection_var.set("CONNECTED")
             self._status_var.set("Logged in. Refreshing dashboard...")
+            self._append_session_log(asset="-", status="login", reason=f"mode={self._service.selected_account_mode}")
             self._sync_button_visibility()
             self.refresh()
         except Exception as exc:
@@ -315,6 +337,7 @@ class DashboardWindow:
         self._is_logged_in = False
         self._connection_var.set("DISCONNECTED")
         self._session_var.set("STOPPED")
+        self._append_session_log(asset="-", status="logout", reason="manual")
         self._sync_button_visibility()
         self._status_var.set("Logged out.")
 
@@ -382,6 +405,7 @@ class DashboardWindow:
         self._highlight_active_pairs(snapshot.current_assets)
         self._sync_button_visibility()
         current_asset = snapshot.current_asset or "-"
+        self._append_session_log(asset=current_asset, status=snapshot.last_run_status or snapshot.status, reason=snapshot.last_reason or "-")
         self._status_var.set(f"Session {snapshot.status} | checking={current_asset} | assets={', '.join(snapshot.selected_assets)} | winrate={snapshot.win_rate_pct:.2f}% | progress={snapshot.progress_value:.2f}{snapshot.progress_label} | reason={snapshot.last_reason}")
         if snapshot.status in {"stopped", "error"}:
             self._checking_var.set("-")
@@ -493,6 +517,39 @@ class DashboardWindow:
         self._apply_local_selection_view(selection_view)
         selected_count = len(self._selected_assets)
         self._status_var.set(f"Selected {selected_count} pair(s). Local stats updated without broker refresh.")
+
+    def _on_login_mode_changed(self, *_args) -> None:
+        self._sync_button_visibility()
+        if not self._is_logged_in:
+            return
+        try:
+            self._service.update_account_mode(self._login_mode_var.get())
+            self.persist_preferences()
+            self.refresh()
+            self._append_session_log(asset="-", status="mode_switch", reason=f"mode={self._service.selected_account_mode}")
+        except Exception as exc:
+            messagebox.showerror("Mode Switch Error", f"{type(exc).__name__}: {exc}")
+            self._status_var.set(f"Mode switch failed: {type(exc).__name__}")
+
+    def _append_session_log(self, *, asset: str, status: str, reason: str) -> None:
+        normalized_asset = asset or "-"
+        normalized_status = status or "-"
+        normalized_reason = reason or "-"
+        row = (_format_clock(datetime.now()), normalized_asset, normalized_status.upper(), normalized_reason)
+        if self._session_log_rows and self._session_log_rows[-1] == row:
+            return
+        self._session_log_rows.append(row)
+        if len(self._session_log_rows) > self._MAX_SESSION_LOG_ROWS:
+            self._session_log_rows = self._session_log_rows[-self._MAX_SESSION_LOG_ROWS :]
+        self._render_session_log_rows()
+
+    def _render_session_log_rows(self) -> None:
+        if self._session_log_tree is None:
+            return
+        for row_id in self._session_log_tree.get_children():
+            self._session_log_tree.delete(row_id)
+        for entry in reversed(self._session_log_rows):
+            self._session_log_tree.insert("", tk.END, values=entry)
 
     def _schedule_auto_refresh(self) -> None:
         self._auto_refresh_job = self._root.after(self._AUTO_REFRESH_MS, self._auto_refresh_tick)
@@ -687,6 +744,10 @@ def _format_updated_at(value: str) -> str:
     except ValueError:
         return value
     return parsed.astimezone().strftime("%H:%M:%S")
+
+
+def _format_clock(value: datetime) -> str:
+    return value.astimezone().strftime("%H:%M:%S")
 
 
 def load_dashboard_preferences(prefs_path: Path) -> dict[str, str]:
