@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from .config import AppConfig
 from .duplicate_guard import DuplicateSignalGuard
+from .iqoption_adapter import IQOptionOrderUnavailableError
 from .journal_service import JournalService
 from .market_data import MarketDataProvider
 from .models import InstrumentType, StrategyVersion, TradeJournalRecord
@@ -122,6 +123,15 @@ class BotRunner:
         if signal_event is None:
             self._log_event("info", "no_signal", "Runner found no signal.", {"asset": plan.asset})
             return BotRunResult(status="skipped", reason="no_signal")
+        if signal_event.is_filtered_out:
+            filter_reason = signal_event.filter_reason or "signal_filtered"
+            self._log_event(
+                "info",
+                "signal_filtered",
+                "Runner skipped a filtered signal.",
+                {"asset": plan.asset, "reason": filter_reason},
+            )
+            return BotRunResult(status="skipped", reason=filter_reason)
 
         if self._duplicate_signal_guard is not None:
             duplicate_check = self._duplicate_signal_guard.check(
@@ -145,14 +155,23 @@ class BotRunner:
             duplicate_fingerprint = None
 
         self._ensure_strategy_version(plan, current_time)
-        tags = {"runner": "bot_runner", **plan.tags}
+        tags = {"runner": "bot_runner", **self._strategy_trade_tags(signal_event), **plan.tags}
         if duplicate_fingerprint is not None:
             tags["signal_fingerprint"] = duplicate_fingerprint
-        trade = self._broker_adapter.submit_order(
-            signal_event=signal_event,
-            strategy_version_id=plan.strategy_version_id,
-            tags=tags,
-        )
+        try:
+            trade = self._broker_adapter.submit_order(
+                signal_event=signal_event,
+                strategy_version_id=plan.strategy_version_id,
+                tags=tags,
+            )
+        except IQOptionOrderUnavailableError as exc:
+            self._log_event(
+                "info",
+                "market_unavailable",
+                "Runner skipped because the broker reported the asset as unavailable for a new order.",
+                {"asset": signal_event.asset, "reason": str(exc)},
+            )
+            return BotRunResult(status="skipped", reason="market_closed_or_unavailable")
         self._log_event(
             "info",
             "trade_submitted",
@@ -199,6 +218,37 @@ class BotRunner:
             change_reason=plan.change_reason,
         )
         self._repository.save_strategy_version(strategy_version)
+
+    def _strategy_trade_tags(self, signal_event) -> dict[str, str]:
+        indicator_snapshot = getattr(signal_event, "indicator_snapshot", {}) or {}
+        contributing_profiles = [str(profile) for profile in indicator_snapshot.get("strategy_profiles", ()) if str(profile)]
+        contributing_names = [str(name) for name in indicator_snapshot.get("strategy_names", ()) if str(name)]
+        if contributing_profiles:
+            tags = {
+                "strategy_profile": contributing_profiles[0],
+                "strategy_profiles": ",".join(contributing_profiles),
+                "strategy_display": " + ".join(contributing_profiles),
+            }
+            if contributing_names:
+                tags["strategy_name"] = contributing_names[0]
+                tags["strategy_names"] = ",".join(contributing_names)
+            return tags
+
+        trade_tags = getattr(self._signal_engine, "trade_tags", None)
+        if callable(trade_tags):
+            return {str(key): str(value) for key, value in trade_tags().items()}
+
+        strategy_profile = getattr(self._signal_engine, "strategy_profile", None)
+        strategy_name = getattr(self._signal_engine, "strategy_name", None)
+        tags: dict[str, str] = {}
+        if isinstance(strategy_profile, str) and strategy_profile:
+            tags["strategy_profile"] = strategy_profile
+            tags["strategy_profiles"] = strategy_profile
+            tags["strategy_display"] = strategy_profile
+        if isinstance(strategy_name, str) and strategy_name:
+            tags["strategy_name"] = strategy_name
+            tags["strategy_names"] = strategy_name
+        return tags
 
     def _validate_limits(self, plan: RunnerPlan, today_utc: date) -> str | None:
         limits = self._config.risk_limits

@@ -11,7 +11,8 @@ from tkinter import messagebox, ttk
 from .config import load_config
 from .dashboard_session import DashboardSessionController, SessionRunConfig, SessionStateSnapshot, SessionStopTargets
 from .env import load_dotenv_file
-from .iqoption_dashboard import DashboardSnapshot, IQOptionDashboardService, LocalSelectionView, OpenPositionRow
+from .iqoption_dashboard import DashboardSnapshot, IQOptionDashboardService, OpenPositionRow
+from .signal_engine import format_strategy_profiles, normalize_strategy_profiles
 from .trade_journal import TradeJournalRepository
 
 
@@ -23,8 +24,8 @@ class MetricCard:
 
 class DashboardWindow:
     _AUTO_REFRESH_MS = 60_000
-    _CHECKLIST_CANVAS_WIDTH = 760
     _MAX_SESSION_LOG_ROWS = 200
+    _SESSION_UPDATE_DEBOUNCE_MS = 120
 
     def __init__(self, root: tk.Tk, service: IQOptionDashboardService, session_controller: DashboardSessionController, prefs_path: Path, dotenv_path: Path):
         self._root = root
@@ -33,13 +34,10 @@ class DashboardWindow:
         self._prefs_path = prefs_path
         self._dotenv_path = dotenv_path
         self._selected_assets: tuple[str, ...] = ()
-        self._pair_checks: dict[str, tk.BooleanVar] = {}
-        self._pair_rows: dict[str, tk.Frame] = {}
-        self._pair_labels: dict[str, tk.Checkbutton] = {}
         self._summary_labels: dict[str, tk.StringVar] = {}
-        self._asset_labels: dict[str, tk.StringVar] = {}
         self._latest_snapshot: DashboardSnapshot | None = None
         self._session_log_rows: list[tuple[str, str, str, str]] = []
+        self._pending_session_snapshots: list[SessionStateSnapshot] = []
         self._is_logged_in = False
         self._show_password = False
         self._password_entry: ttk.Entry | None = None
@@ -53,9 +51,22 @@ class DashboardWindow:
         self._scroll_window_id: int | None = None
         self._auto_refresh_job: str | None = None
         self._session_log_tree: ttk.Treeview | None = None
+        self._session_update_job: str | None = None
+        self._analytics_window: tk.Toplevel | None = None
+        self._analytics_asset_tree: ttk.Treeview | None = None
+        self._analytics_session_tree: ttk.Treeview | None = None
+        self._pair_selector_window: tk.Toplevel | None = None
+        self._pair_selector_frame: tk.Frame | None = None
+        self._pair_checks: dict[str, tk.BooleanVar] = {}
+        self._pair_rows: dict[str, tk.Frame] = {}
+        self._pair_labels: dict[str, tk.Checkbutton] = {}
+        self._pair_status_labels: dict[str, tk.Label] = {}
+        self._pair_chance_labels: dict[str, tk.Label] = {}
+        self._pair_render_cache: dict[str, tuple[object, ...]] = {}
 
         preferences = load_dashboard_preferences(self._prefs_path)
         saved_username = preferences.get("last_username", "")
+        self._selected_assets = _load_selected_assets(preferences)
 
         self._status_var = tk.StringVar(value="Click Login to connect.")
         self._balance_var = tk.StringVar(value="-")
@@ -75,6 +86,11 @@ class DashboardWindow:
         self._poll_var = tk.StringVar(value=preferences.get("poll_sec", "5"))
         self._target_mode_var = tk.StringVar(value=preferences.get("target_mode", "$"))
         self._batch_size_var = tk.StringVar(value=preferences.get("batch_size", "2"))
+        strategy_profiles = _load_strategy_profiles(preferences)
+        self._strategy_vars = {
+            profile: tk.BooleanVar(value=profile in strategy_profiles)
+            for profile in ("LOW", "MEDIUM", "HIGH")
+        }
         self._login_mode_var = tk.StringVar(value=preferences.get("login_account_mode", "PRACTICE"))
         self._profit_target_var = tk.StringVar(value=preferences.get("profit_target", "5"))
         self._loss_limit_var = tk.StringVar(value=preferences.get("loss_limit", "5"))
@@ -119,12 +135,8 @@ class DashboardWindow:
 
         top = tk.Frame(self._scroll_frame, bg="#f3efe6")
         top.pack(fill=tk.X)
-        top_primary = tk.Frame(top, bg="#f3efe6")
-        top_primary.pack(fill=tk.X)
-        cards_row = tk.Frame(top_primary, bg="#f3efe6")
-        cards_row.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        controls_row = tk.Frame(top_primary, bg="#f3efe6")
-        controls_row.pack(side=tk.RIGHT, anchor="ne")
+        cards_row = tk.Frame(top, bg="#f3efe6")
+        cards_row.pack(fill=tk.X)
 
         self._build_info_card(cards_row, "Balance", self._balance_var, width=96).pack(side=tk.LEFT, padx=(0, 12))
         self._build_info_card(cards_row, "Mode", self._mode_var, width=220).pack(side=tk.LEFT, padx=(0, 12))
@@ -135,19 +147,25 @@ class DashboardWindow:
         self._build_info_card(cards_row, "Block Reason", self._block_reason_var, width=300).pack(side=tk.LEFT, padx=(0, 12))
         self._build_info_card(cards_row, "Checking", self._checking_var, width=300).pack(side=tk.LEFT, padx=(0, 12))
 
+        controls_row = tk.Frame(top, bg="#f3efe6")
+        controls_row.pack(fill=tk.X, pady=(12, 0))
         secondary_cards = tk.Frame(top, bg="#f3efe6")
         secondary_cards.pack(fill=tk.X, pady=(12, 0))
-        self._build_info_card(secondary_cards, "Selected", self._asset_var, width=500).pack(side=tk.LEFT, padx=(0, 12))
-        self._build_info_card(secondary_cards, "Recommended", self._recommended_var, width=500).pack(side=tk.LEFT, padx=(0, 12))
+        self._build_info_card(secondary_cards, "Scanning Assets", self._asset_var, width=500).pack(side=tk.LEFT, padx=(0, 12))
+        self._build_info_card(secondary_cards, "Scanning Count", self._recommended_var, width=220).pack(side=tk.LEFT, padx=(0, 12))
 
         button_bar = controls_row
         button_bar.grid_columnconfigure(0, minsize=98)
         button_bar.grid_columnconfigure(1, minsize=98)
         button_bar.grid_columnconfigure(2, minsize=98)
         button_bar.grid_columnconfigure(3, minsize=98)
+        button_bar.grid_columnconfigure(4, minsize=98)
+        button_bar.grid_columnconfigure(5, minsize=98)
         self._login_button = ttk.Button(button_bar, text="Login", command=self.login)
         self._logout_button = ttk.Button(button_bar, text="Logout", command=self.logout)
         self._refresh_button = ttk.Button(button_bar, text="Refresh", command=self.refresh)
+        self._pair_selector_button = ttk.Button(button_bar, text="Pair Selector", command=self.open_pair_selector_window)
+        self._analytics_button = ttk.Button(button_bar, text="Analytics", command=self.open_analytics_window)
         self._reconcile_button = ttk.Button(button_bar, text="Reconcile", command=self.reconcile_stale_trades)
         self._force_close_button = ttk.Button(button_bar, text="Force Close", command=self.force_close_open_trades)
         self._start_button = ttk.Button(button_bar, text="Start", command=self.start_session)
@@ -157,15 +175,14 @@ class DashboardWindow:
 
         body = tk.Frame(self._scroll_frame, bg="#f3efe6", pady=8)
         body.pack(fill=tk.BOTH, expand=True)
-        left = tk.Frame(body, bg="#f3efe6", width=900)
+        left = tk.Frame(body, bg="#f3efe6", width=760)
         left.pack(side=tk.LEFT, fill=tk.BOTH)
         left.pack_propagate(False)
         right = tk.Frame(body, bg="#f3efe6")
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(18, 0))
 
         self._build_controls_panel(left)
-        self._build_checklist_panel(left)
-        self._build_metrics_panel(right)
+        self._build_metrics_panel(left)
         self._build_open_positions_panel(right)
         self._build_session_log_panel(right)
         self._build_history_panel(right)
@@ -230,10 +247,27 @@ class DashboardWindow:
         self._add_labeled_entry(left_column, "Timeframe sec", self._timeframe_var)
         self._add_labeled_entry(left_column, "Expiry sec", self._expiry_var)
         self._add_labeled_entry(right_column, "Poll sec", self._poll_var)
+        self._add_strategy_selector(right_column)
         self._add_combobox_entry(right_column, "Target mode", self._target_mode_var, values=("$", "%"), width=8)
         self._add_combobox_entry(right_column, "Check per round", self._batch_size_var, values=("1", "2", "ALL"), width=8)
         self._add_labeled_entry(left_column, "Profit target", self._profit_target_var)
         self._add_labeled_entry(right_column, "Loss limit", self._loss_limit_var)
+
+    def _add_strategy_selector(self, parent: tk.Widget) -> None:
+        row = tk.Frame(parent, bg="#f8f5ee")
+        row.pack(fill=tk.X, pady=(10, 0))
+        tk.Label(row, text="Strategies", bg="#f8f5ee", fg="#38423c", font=("Segoe UI", 10)).pack(anchor="w")
+        selector_row = tk.Frame(row, bg="#f8f5ee")
+        selector_row.pack(anchor="w", pady=(4, 0))
+        for profile in ("LOW", "MEDIUM", "HIGH"):
+            tk.Checkbutton(
+                selector_row,
+                text=profile,
+                variable=self._strategy_vars[profile],
+                bg="#f8f5ee",
+                activebackground="#f8f5ee",
+                command=self._handle_strategy_selection_change,
+            ).pack(side=tk.LEFT, padx=(0, 8))
 
     def _add_labeled_entry(self, parent: tk.Widget, label: str, variable: tk.StringVar) -> None:
         row = tk.Frame(parent, bg="#f8f5ee")
@@ -263,48 +297,28 @@ class DashboardWindow:
         tk.Label(row, text=label, bg="#f8f5ee", fg="#38423c", font=("Segoe UI", 10)).pack(anchor="w")
         ttk.Combobox(row, textvariable=variable, values=values, state="readonly", width=width).pack(anchor="w", pady=(4, 0))
 
-    def _build_checklist_panel(self, parent: tk.Widget) -> None:
-        frame = tk.Frame(parent, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1)
-        frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
-        header = tk.Frame(frame, bg="#f8f5ee")
-        header.pack(fill=tk.X, padx=14, pady=(14, 8))
-        ttk.Button(header, text="All", command=self.select_all_pairs).pack(side=tk.RIGHT)
-        ttk.Button(header, text="Clear", command=self.clear_all_pairs).pack(side=tk.RIGHT, padx=(0, 8))
-
-        canvas = tk.Canvas(frame, bg="#f8f5ee", bd=0, highlightthickness=0, width=self._CHECKLIST_CANVAS_WIDTH)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        self._checklist_frame = tk.Frame(canvas, bg="#f8f5ee")
-        canvas.create_window((0, 0), window=self._checklist_frame, anchor="nw")
-        self._checklist_frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-
     def _build_metrics_panel(self, parent: tk.Widget) -> None:
         frame = tk.Frame(parent, bg="#f3efe6")
-        frame.pack(fill=tk.X)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
 
         summary_frame = tk.Frame(frame, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1, padx=14, pady=12)
-        summary_frame.pack(fill=tk.X)
-        tk.Label(summary_frame, text="Binary Summary", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w")
+        summary_frame.pack(fill=tk.BOTH, expand=True)
+        header = tk.Frame(summary_frame, bg="#f8f5ee")
+        header.pack(fill=tk.X)
+        tk.Label(header, text="Binary Summary", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(side=tk.LEFT, anchor="w")
+        self._clear_data_button = ttk.Button(header, text="Clear Data", command=self.clear_binary_history)
+        self._clear_data_button.pack(side=tk.RIGHT)
         self._summary_grid = tk.Frame(summary_frame, bg="#f8f5ee")
         self._summary_grid.pack(fill=tk.X, pady=(10, 0))
-
-        asset_frame = tk.Frame(frame, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1, padx=14, pady=12)
-        asset_frame.pack(fill=tk.X, pady=(14, 0))
-        tk.Label(asset_frame, text="Selected Pair Stats", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w")
-        self._asset_grid = tk.Frame(asset_frame, bg="#f8f5ee")
-        self._asset_grid.pack(fill=tk.X, pady=(10, 0))
 
     def _build_history_panel(self, parent: tk.Widget) -> None:
         frame = tk.Frame(parent, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1)
         frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
         tk.Label(frame, text="Recent Binary Trades", bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w", padx=14, pady=(14, 8))
 
-        columns = ("asset", "opened", "direction", "result", "amount", "pnl", "payout")
+        columns = ("asset", "opened", "strategy", "direction", "result", "amount", "pnl", "payout")
         self._history_tree = ttk.Treeview(frame, columns=columns, show="headings", height=16)
-        for key, title, width, anchor in (("asset", "Pair", 90, "w"), ("opened", "Opened", 180, "w"), ("direction", "Direction", 80, "center"), ("result", "Result", 90, "center"), ("amount", "Amount", 80, "e"), ("pnl", "P/L", 80, "e"), ("payout", "Payout", 80, "e")):
+        for key, title, width, anchor in (("asset", "Pair", 90, "w"), ("opened", "Opened", 180, "w"), ("strategy", "Strategy", 140, "w"), ("direction", "Direction", 80, "center"), ("result", "Result", 90, "center"), ("amount", "Amount", 80, "e"), ("pnl", "P/L", 80, "e"), ("payout", "Payout", 80, "e")):
             self._history_tree.heading(key, text=title)
             self._history_tree.column(key, width=width, anchor=anchor)
         self._history_tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
@@ -417,6 +431,21 @@ class DashboardWindow:
         self.refresh()
         self._status_var.set(f"Force close complete. {reason}")
 
+    def clear_binary_history(self) -> None:
+        if not self._is_logged_in:
+            self._status_var.set("Login before clearing binary history.")
+            return
+        if self._session_controller.is_running:
+            self._status_var.set("Stop the session before clearing binary history.")
+            return
+        if not messagebox.askyesno("Clear Data", "Clear Binary Summary and Recent Binary Trades history for the current account mode?"):
+            return
+        deleted_trades = self._service.clear_binary_history()
+        self._status_var.set(f"Clearing binary history... removed {deleted_trades} trade(s).")
+        self.refresh()
+        self._append_session_log(asset="-", status="clear_data", reason=f"deleted_trades={deleted_trades}")
+        self._status_var.set(f"Binary history cleared. Removed {deleted_trades} trade(s).")
+
     def start_session(self) -> None:
         if self._session_controller.is_running:
             self._status_var.set("Session is already running.")
@@ -426,8 +455,9 @@ class DashboardWindow:
             return
         try:
             run_config = SessionRunConfig(
-                assets=self._read_selected_assets(require_selection=True),
+                assets=self._read_run_assets(),
                 batch_size=_parse_batch_size(self._batch_size_var.get()),
+                strategy_profiles=self._read_strategy_profiles(require_selection=True),
                 stake_amount=float(self._stake_var.get()),
                 timeframe_sec=int(self._timeframe_var.get()),
                 expiry_sec=int(self._expiry_var.get()),
@@ -455,19 +485,28 @@ class DashboardWindow:
             self._status_var.set("Stopping session...")
 
     def _handle_session_update(self, snapshot: SessionStateSnapshot) -> None:
-        self._root.after(0, self._apply_session_update, snapshot)
+        self._pending_session_snapshots.append(snapshot)
+        if len(self._pending_session_snapshots) > 200:
+            self._pending_session_snapshots = self._pending_session_snapshots[-200:]
+        if self._session_update_job is None:
+            self._session_update_job = self._root.after(self._SESSION_UPDATE_DEBOUNCE_MS, self._flush_session_update)
+
+    def _flush_session_update(self) -> None:
+        self._session_update_job = None
+        pending_snapshots = self._pending_session_snapshots
+        self._pending_session_snapshots = []
+        for snapshot in pending_snapshots:
+            self._apply_session_update(snapshot)
 
     def _apply_session_update(self, snapshot: SessionStateSnapshot) -> None:
         self._session_var.set(snapshot.status.upper())
         self._checking_var.set(snapshot.current_asset or "-")
-        self._highlight_active_pairs(snapshot.current_assets)
         self._sync_button_visibility()
         current_asset = snapshot.current_asset or "-"
         self._append_session_log(asset=current_asset, status=snapshot.last_run_status or snapshot.status, reason=snapshot.last_reason or "-")
         self._status_var.set(f"Session {snapshot.status} | checking={current_asset} | assets={', '.join(snapshot.selected_assets)} | winrate={snapshot.win_rate_pct:.2f}% | progress={snapshot.progress_value:.2f}{snapshot.progress_label} | reason={snapshot.last_reason}")
         if snapshot.status in {"stopped", "error"}:
             self._checking_var.set("-")
-            self._highlight_active_pairs(())
             self.refresh()
 
     def _apply_snapshot(self, snapshot: DashboardSnapshot) -> None:
@@ -478,106 +517,20 @@ class DashboardWindow:
         self._market_var.set(snapshot.market_status)
         self._apply_market_status_style(snapshot.market_status)
         self._asset_var.set(_join_assets(snapshot.selected_assets))
-        self._recommended_var.set(_join_assets(tuple(pair.asset for pair in snapshot.recommended_pairs)))
+        self._recommended_var.set(f"{len(snapshot.selected_assets)} pair(s)")
         self._open_positions_var.set(str(len(snapshot.open_positions)))
         self._block_reason_var.set(snapshot.block_reason)
-        self._render_checklist(snapshot)
         self._render_metric_cards(self._summary_grid, self._summary_labels, _summary_cards(snapshot.summary_metrics))
         self._render_open_positions_rows(snapshot.open_positions)
-        self._apply_local_selection_view(
-            LocalSelectionView(
-                selected_assets=snapshot.selected_assets,
-                selected_asset_metrics=snapshot.selected_asset_metrics,
-                recent_trades=snapshot.recent_trades,
-            )
-        )
+        self._render_history_rows(snapshot.recent_trades)
+        self._refresh_analytics_if_open()
+        if self._pair_selector_window is not None and self._pair_selector_window.winfo_exists():
+            self._render_pair_selector_rows()
 
-    def _render_checklist(self, snapshot: DashboardSnapshot) -> None:
-        for child in self._checklist_frame.winfo_children():
-            child.destroy()
-        self._pair_checks.clear()
-        self._pair_rows.clear()
-        self._pair_labels.clear()
-        for pair in snapshot.binary_pairs:
-            var = tk.BooleanVar(value=pair.asset in snapshot.selected_assets)
-            self._pair_checks[pair.asset] = var
-            row = tk.Frame(self._checklist_frame, bg="#f8f5ee")
-            row.pack(fill=tk.X, anchor="w", padx=12, pady=4)
-            self._pair_rows[pair.asset] = row
-            status_bg, status_fg = _status_colors(pair.is_open)
-            tk.Label(
-                row,
-                text="OPEN" if pair.is_open else "CLOSED",
-                bg=status_bg,
-                fg=status_fg,
-                font=("Segoe UI Semibold", 9),
-                padx=8,
-                pady=2,
-            ).pack(side=tk.LEFT, padx=(0, 8))
-            chance_bg, chance_fg = _chance_band_colors(pair.opportunity_band)
-            tk.Label(
-                row,
-                text=f"{pair.opportunity_band} {pair.opportunity_score_pct:.1f}%",
-                bg=chance_bg,
-                fg=chance_fg,
-                font=("Segoe UI Semibold", 9),
-                padx=8,
-                pady=2,
-            ).pack(side=tk.LEFT, padx=(0, 8))
-            label = (
-                f"{pair.asset} | payout {_format_pct(pair.payout)} | winrate {pair.win_rate_pct:.2f}%\n"
-                f"trades {pair.trade_count} | updated {_format_updated_at(pair.opportunity_updated_at_utc)}"
-            )
-            if pair.is_recommended:
-                label += f" | recommended: {pair.recommendation_reason}"
-            checkbox = tk.Checkbutton(
-                row,
-                text=label,
-                variable=var,
-                bg="#f8f5ee",
-                fg="#1f2a1f" if pair.is_open else "#7b4b4b",
-                activebackground="#f8f5ee",
-                activeforeground="#1f2a1f" if pair.is_open else "#7b4b4b",
-                anchor="w",
-                justify=tk.LEFT,
-                wraplength=540,
-                command=self._update_selected_assets_from_checklist,
-            )
-            checkbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self._pair_labels[pair.asset] = checkbox
-
-    def _highlight_active_pairs(self, assets: tuple[str, ...]) -> None:
-        active_assets = set(assets)
-        for asset, row in self._pair_rows.items():
-            is_active = asset in active_assets
-            background = "#e0ebff" if is_active else "#f8f5ee"
-            row.configure(bg=background)
-            label = self._pair_labels.get(asset)
-            if label is not None:
-                label.configure(bg=background, activebackground=background)
-
-    def _update_selected_assets_from_checklist(self) -> None:
-        self._selected_assets = self._read_selected_assets(require_selection=False)
-        self._asset_var.set(_join_assets(self._selected_assets))
-        self._apply_cached_selection()
-
-    def select_all_pairs(self) -> None:
-        for var in self._pair_checks.values():
-            var.set(True)
-        self._update_selected_assets_from_checklist()
-
-    def clear_all_pairs(self) -> None:
-        for var in self._pair_checks.values():
-            var.set(False)
-        self._update_selected_assets_from_checklist()
-
-    def _apply_cached_selection(self) -> None:
-        if self._latest_snapshot is None:
+    def _handle_strategy_selection_change(self) -> None:
+        if any(variable.get() for variable in self._strategy_vars.values()):
             return
-        selection_view = self._service.build_local_selection_view(selected_assets=self._selected_assets)
-        self._apply_local_selection_view(selection_view)
-        selected_count = len(self._selected_assets)
-        self._status_var.set(f"Selected {selected_count} pair(s). Local stats updated without broker refresh.")
+        self._strategy_vars["MEDIUM"].set(True)
 
     def _on_login_mode_changed(self, *_args) -> None:
         self._sync_button_visibility()
@@ -602,7 +555,13 @@ class DashboardWindow:
         self._session_log_rows.append(row)
         if len(self._session_log_rows) > self._MAX_SESSION_LOG_ROWS:
             self._session_log_rows = self._session_log_rows[-self._MAX_SESSION_LOG_ROWS :]
-        self._render_session_log_rows()
+        if self._session_log_tree is None:
+            return
+        self._session_log_tree.insert("", 0, values=row)
+        children = self._session_log_tree.get_children()
+        if len(children) > self._MAX_SESSION_LOG_ROWS:
+            for row_id in children[self._MAX_SESSION_LOG_ROWS :]:
+                self._session_log_tree.delete(row_id)
 
     def _render_session_log_rows(self) -> None:
         if self._session_log_tree is None:
@@ -631,17 +590,18 @@ class DashboardWindow:
                 pass
         self._schedule_auto_refresh()
 
-    def _apply_local_selection_view(self, selection_view: LocalSelectionView) -> None:
-        self._render_metric_cards(self._asset_grid, self._asset_labels, _summary_cards(selection_view.selected_asset_metrics))
-        self._render_history_rows(selection_view.recent_trades)
-
     def _sync_button_visibility(self) -> None:
         self._set_button_visibility(self._login_button, visible=not self._is_logged_in)
         self._set_button_visibility(self._logout_button, visible=self._is_logged_in)
         is_running = self._session_controller.is_running or self._session_var.get() == "STOPPING"
         self._set_button_visibility(self._start_button, visible=not is_running)
         self._set_button_visibility(self._stop_button, visible=is_running)
-        self._refresh_button.configure(state=tk.NORMAL if self._is_logged_in else tk.DISABLED)
+        enabled_state = tk.NORMAL if self._is_logged_in else tk.DISABLED
+        self._refresh_button.configure(state=enabled_state)
+        self._pair_selector_button.configure(state=enabled_state)
+        self._analytics_button.configure(state=enabled_state)
+        if hasattr(self, "_clear_data_button"):
+            self._clear_data_button.configure(state=tk.NORMAL if self._is_logged_in and not is_running else tk.DISABLED)
         self._reconcile_button.configure(state=tk.NORMAL if not is_running else tk.DISABLED)
         self._force_close_button.configure(state=tk.NORMAL if not is_running else tk.DISABLED)
         start_enabled = self._is_logged_in and self._login_mode_var.get().upper() == "PRACTICE"
@@ -663,6 +623,8 @@ class DashboardWindow:
                 "timeframe_sec": self._timeframe_var.get(),
                 "expiry_sec": self._expiry_var.get(),
                 "poll_sec": self._poll_var.get(),
+                "strategy_profiles": format_strategy_profiles(self._read_strategy_profiles(require_selection=True)),
+                "selected_assets": ",".join(self._selected_assets),
                 "target_mode": self._target_mode_var.get(),
                 "batch_size": self._batch_size_var.get(),
                 "login_account_mode": self._login_mode_var.get(),
@@ -695,8 +657,10 @@ class DashboardWindow:
             (self._login_button, 0, 0),
             (self._logout_button, 0, 0),
             (self._refresh_button, 0, 1),
-            (self._reconcile_button, 0, 2),
-            (self._force_close_button, 0, 3),
+            (self._pair_selector_button, 0, 2),
+            (self._analytics_button, 0, 3),
+            (self._reconcile_button, 0, 4),
+            (self._force_close_button, 0, 5),
             (self._start_button, 1, 0),
             (self._stop_button, 1, 0),
         )
@@ -715,23 +679,43 @@ class DashboardWindow:
         else:
             self._stop_button.grid_remove()
 
-    def _read_selected_assets(self, *, require_selection: bool) -> tuple[str, ...]:
-        selected = tuple(asset for asset, var in self._pair_checks.items() if var.get())
+    def _read_run_assets(self) -> tuple[str, ...]:
+        if self._selected_assets:
+            return self._selected_assets
+        if self._latest_snapshot is None:
+            snapshot = self._service.load_snapshot(selected_assets=None)
+            self._apply_snapshot(snapshot)
+        assets = tuple(
+            pair.asset
+            for pair in (self._latest_snapshot.binary_pairs if self._latest_snapshot is not None else ())
+            if pair.is_supported and pair.is_open
+        )
+        if not assets:
+            raise ValueError("No supported OTC pairs are currently available.")
+        return assets
+
+    def _read_strategy_profiles(self, *, require_selection: bool) -> tuple[str, ...]:
+        selected = tuple(profile for profile, variable in self._strategy_vars.items() if variable.get())
         if require_selection and not selected:
-            raise ValueError("Select at least one binary pair.")
-        return selected
+            raise ValueError("Select at least one strategy profile.")
+        return normalize_strategy_profiles(selected)
 
     def _render_metric_cards(self, parent: tk.Widget, state: dict[str, tk.StringVar], cards: list[MetricCard]) -> None:
-        for child in parent.winfo_children():
-            child.destroy()
-        state.clear()
-        for index, card in enumerate(cards):
-            slot = tk.Frame(parent, bg="#efe9dc", padx=10, pady=10)
-            slot.grid(row=index // 4, column=index % 4, sticky="nsew", padx=6, pady=6)
-            value_var = tk.StringVar(value=card.value)
-            state[card.label] = value_var
-            tk.Label(slot, text=card.label, bg="#efe9dc", fg="#6b705c", font=("Segoe UI", 9)).pack(anchor="w")
-            tk.Label(slot, textvariable=value_var, bg="#efe9dc", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(4, 0))
+        card_labels = [card.label for card in cards]
+        if tuple(state) != tuple(card_labels):
+            for child in parent.winfo_children():
+                child.destroy()
+            state.clear()
+            for index, card in enumerate(cards):
+                slot = tk.Frame(parent, bg="#efe9dc", padx=10, pady=10)
+                slot.grid(row=index // 4, column=index % 4, sticky="nsew", padx=6, pady=6)
+                value_var = tk.StringVar(value=card.value)
+                state[card.label] = value_var
+                tk.Label(slot, text=card.label, bg="#efe9dc", fg="#6b705c", font=("Segoe UI", 9)).pack(anchor="w")
+                tk.Label(slot, textvariable=value_var, bg="#efe9dc", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(4, 0))
+            return
+        for card in cards:
+            state[card.label].set(card.value)
 
     def _render_history(self, snapshot: DashboardSnapshot) -> None:
         self._render_history_rows(snapshot.recent_trades)
@@ -740,7 +724,213 @@ class DashboardWindow:
         for row_id in self._history_tree.get_children():
             self._history_tree.delete(row_id)
         for trade in trades:
-            self._history_tree.insert("", tk.END, values=(trade.asset, trade.opened_at_utc.replace("T", " ")[:19], trade.direction.upper(), trade.result, f"{trade.amount:.2f}", _format_money(trade.profit_loss_abs), _format_pct(trade.payout_snapshot)))
+            self._history_tree.insert("", tk.END, values=(trade.asset, trade.opened_at_utc.replace("T", " ")[:19], trade.strategy_display, trade.direction.upper(), trade.result, f"{trade.amount:.2f}", _format_money(trade.profit_loss_abs), _format_pct(trade.payout_snapshot)))
+
+    def open_analytics_window(self) -> None:
+        if self._analytics_window is not None and self._analytics_window.winfo_exists():
+            self._analytics_window.lift()
+            self._refresh_analytics_if_open()
+            return
+
+        self._analytics_window = tk.Toplevel(self._root)
+        self._analytics_window.title("Strategy Analytics")
+        self._analytics_window.geometry("1180x760")
+        self._analytics_window.configure(bg="#f3efe6")
+        self._analytics_window.protocol("WM_DELETE_WINDOW", self._close_analytics_window)
+
+        shell = tk.Frame(self._analytics_window, bg="#f3efe6", padx=18, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._analytics_asset_tree = self._build_analytics_panel(shell, title="Strategy by Pair")
+        self._analytics_session_tree = self._build_analytics_panel(shell, title="Strategy by Session")
+        self._refresh_analytics_if_open()
+
+    def _build_analytics_panel(self, parent: tk.Widget, *, title: str) -> ttk.Treeview:
+        frame = tk.Frame(parent, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(0, 14))
+        tk.Label(frame, text=title, bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w", padx=14, pady=(14, 8))
+        columns = ("strategy", "group", "trades", "wins", "losses", "win_rate", "net_pnl", "profit_factor")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
+        for key, label, width, anchor in (("strategy", "Strategy", 120, "w"), ("group", "Group", 140, "w"), ("trades", "Trades", 70, "e"), ("wins", "Wins", 70, "e"), ("losses", "Losses", 70, "e"), ("win_rate", "Win Rate", 90, "e"), ("net_pnl", "Net P/L", 90, "e"), ("profit_factor", "Profit Factor", 100, "e")):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor=anchor)
+        tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+        return tree
+
+    def _refresh_analytics_if_open(self) -> None:
+        if self._analytics_window is None or not self._analytics_window.winfo_exists():
+            return
+        analytics = self._service.build_strategy_analytics_snapshot()
+        if self._analytics_asset_tree is not None:
+            self._render_analytics_rows(self._analytics_asset_tree, analytics.by_asset)
+        if self._analytics_session_tree is not None:
+            self._render_analytics_rows(self._analytics_session_tree, analytics.by_session)
+
+    def _render_analytics_rows(self, tree: ttk.Treeview, rows) -> None:
+        for row_id in tree.get_children():
+            tree.delete(row_id)
+        for row in rows:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.strategy_display,
+                    row.group_value,
+                    row.trades,
+                    row.wins,
+                    row.losses,
+                    f"{row.win_rate_pct:.2f}%",
+                    f"{row.net_pnl:.2f}",
+                    f"{row.profit_factor:.2f}",
+                ),
+            )
+
+    def _close_analytics_window(self) -> None:
+        if self._analytics_window is not None and self._analytics_window.winfo_exists():
+            self._analytics_window.destroy()
+        self._analytics_window = None
+        self._analytics_asset_tree = None
+        self._analytics_session_tree = None
+
+    def open_pair_selector_window(self) -> None:
+        if self._latest_snapshot is None:
+            self.refresh()
+        if self._pair_selector_window is not None and self._pair_selector_window.winfo_exists():
+            self._pair_selector_window.lift()
+            self._render_pair_selector_rows()
+            return
+
+        window = tk.Toplevel(self._root)
+        window.title("Pair Selector")
+        window.geometry("940x760")
+        window.configure(bg="#f3efe6")
+        window.protocol("WM_DELETE_WINDOW", self._close_pair_selector_window)
+        self._pair_selector_window = window
+
+        shell = tk.Frame(window, bg="#f3efe6", padx=18, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+
+        header = tk.Frame(shell, bg="#f3efe6")
+        header.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(header, text="Select Pairs", bg="#f3efe6", fg="#1f2a1f", font=("Segoe UI Semibold", 16)).pack(side=tk.LEFT)
+        ttk.Button(header, text="All", command=self.select_all_pairs).pack(side=tk.RIGHT)
+        ttk.Button(header, text="Clear", command=self.clear_all_pairs).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(header, text="Apply", command=self.apply_pair_selection).pack(side=tk.RIGHT, padx=(0, 8))
+
+        frame = tk.Frame(shell, bg="#f8f5ee", highlightbackground="#d8cfbf", highlightthickness=1)
+        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(frame, bg="#f8f5ee", bd=0, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        self._pair_selector_frame = tk.Frame(canvas, bg="#f8f5ee")
+        canvas.create_window((0, 0), window=self._pair_selector_frame, anchor="nw")
+        self._pair_selector_frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._render_pair_selector_rows()
+
+    def _render_pair_selector_rows(self) -> None:
+        snapshot = self._latest_snapshot
+        if snapshot is None or self._pair_selector_frame is None:
+            return
+        rendered_assets: set[str] = set()
+        for pair in snapshot.binary_pairs:
+            rendered_assets.add(pair.asset)
+            is_selected = pair.asset in snapshot.selected_assets
+            self._upsert_pair_row(pair=pair, is_selected=is_selected)
+
+        for asset in tuple(self._pair_rows):
+            if asset in rendered_assets:
+                continue
+            row = self._pair_rows.pop(asset)
+            row.destroy()
+            self._pair_checks.pop(asset, None)
+            self._pair_labels.pop(asset, None)
+            self._pair_status_labels.pop(asset, None)
+            self._pair_chance_labels.pop(asset, None)
+            self._pair_render_cache.pop(asset, None)
+
+    def _upsert_pair_row(self, *, pair, is_selected: bool) -> None:
+        if self._pair_selector_frame is None:
+            return
+        render_key = _pair_render_key(pair)
+        row = self._pair_rows.get(pair.asset)
+        var = self._pair_checks.get(pair.asset)
+        if row is None or var is None:
+            var = tk.BooleanVar(value=is_selected)
+            self._pair_checks[pair.asset] = var
+            row = tk.Frame(self._pair_selector_frame, bg="#f8f5ee")
+            self._pair_rows[pair.asset] = row
+            status_label = tk.Label(row, font=("Segoe UI Semibold", 9), padx=8, pady=2)
+            status_label.pack(side=tk.LEFT, padx=(0, 8))
+            chance_label = tk.Label(row, font=("Segoe UI Semibold", 9), padx=8, pady=2)
+            chance_label.pack(side=tk.LEFT, padx=(0, 8))
+            checkbox = tk.Checkbutton(
+                row,
+                variable=var,
+                bg="#f8f5ee",
+                activebackground="#f8f5ee",
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=620,
+            )
+            checkbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._pair_status_labels[pair.asset] = status_label
+            self._pair_chance_labels[pair.asset] = chance_label
+            self._pair_labels[pair.asset] = checkbox
+            self._pair_render_cache[pair.asset] = ()
+        if var.get() != is_selected:
+            var.set(is_selected)
+
+        if self._pair_render_cache.get(pair.asset) != render_key:
+            status_text, status_bg, status_fg = _status_colors(pair.is_open, pair.is_supported)
+            chance_bg, chance_fg = _chance_band_colors(pair.opportunity_band)
+            checkbox = self._pair_labels[pair.asset]
+            checkbox_fg = "#1f2a1f" if pair.is_supported else "#7c7c7c"
+            self._pair_status_labels[pair.asset].configure(text=status_text, bg=status_bg, fg=status_fg)
+            self._pair_chance_labels[pair.asset].configure(text=f"{pair.opportunity_band} {pair.opportunity_score_pct:.1f}%", bg=chance_bg, fg=chance_fg)
+            checkbox.configure(
+                text=_pair_display_text(pair),
+                fg=checkbox_fg,
+                activeforeground=checkbox_fg,
+                state=tk.NORMAL if pair.is_supported else tk.DISABLED,
+            )
+            self._pair_render_cache[pair.asset] = render_key
+
+        row.pack_forget()
+        row.pack(fill=tk.X, anchor="w", padx=12, pady=4)
+
+    def select_all_pairs(self) -> None:
+        supported_assets = {
+            pair.asset
+            for pair in (self._latest_snapshot.binary_pairs if self._latest_snapshot is not None else ())
+            if pair.is_supported and pair.is_open
+        }
+        for asset, var in self._pair_checks.items():
+            var.set(asset in supported_assets)
+
+    def clear_all_pairs(self) -> None:
+        for var in self._pair_checks.values():
+            var.set(False)
+
+    def apply_pair_selection(self) -> None:
+        self._selected_assets = tuple(asset for asset, var in self._pair_checks.items() if var.get())
+        try:
+            snapshot = self._service.load_snapshot(selected_assets=self._selected_assets)
+        except Exception as exc:
+            messagebox.showerror("Pair Selector Error", f"{type(exc).__name__}: {exc}")
+            return
+        self._apply_snapshot(snapshot)
+        if self._selected_assets:
+            self._status_var.set(f"Pair selector applied. {len(self._selected_assets)} pair(s) selected.")
+        else:
+            self._status_var.set("Pair selector cleared. Scanning all supported OTC pairs.")
+
+    def _close_pair_selector_window(self) -> None:
+        if self._pair_selector_window is not None and self._pair_selector_window.winfo_exists():
+            self._pair_selector_window.destroy()
+        self._pair_selector_window = None
+        self._pair_selector_frame = None
 
     def _render_open_positions_rows(self, open_positions: tuple[OpenPositionRow, ...]) -> None:
         for row_id in self._open_positions_tree.get_children():
@@ -776,6 +966,30 @@ def _summary_cards(metrics) -> list[MetricCard]:
     ]
 
 
+def _pair_display_text(pair) -> str:
+    support_suffix = "" if pair.is_supported else " | unsupported for chart lookup"
+    return (
+        f"{pair.asset} | payout {_format_pct(pair.payout)} | winrate {pair.win_rate_pct:.2f}%\n"
+        f"trades {pair.trade_count} | updated {_format_updated_at(pair.opportunity_updated_at_utc)}{support_suffix}"
+    )
+
+
+def _pair_render_key(pair) -> tuple[object, ...]:
+    return (
+        pair.asset,
+        pair.payout,
+        pair.is_open,
+        pair.is_supported,
+        pair.trade_count,
+        pair.win_rate_pct,
+        pair.opportunity_score_pct,
+        pair.opportunity_band,
+        pair.opportunity_updated_at_utc,
+        pair.is_recommended,
+        pair.recommendation_reason,
+    )
+
+
 def _format_pct(value: float | None) -> str:
     if value is None:
         return "-"
@@ -800,10 +1014,12 @@ def _format_account_mode(account_mode: str) -> str:
     return f"IQ OPTION {account_mode.upper()}"
 
 
-def _status_colors(is_open: bool) -> tuple[str, str]:
+def _status_colors(is_open: bool, is_supported: bool) -> tuple[str, str, str]:
+    if is_open and is_supported:
+        return "OPEN", "#dff3e4", "#1f6b35"
     if is_open:
-        return "#dff3e4", "#1f6b35"
-    return "#f8dddd", "#8a1f1f"
+        return "OPEN but unsupported", "#ececec", "#666666"
+    return "CLOSED", "#f8dddd", "#8a1f1f"
 
 
 def _market_card_colors(market_status: str) -> tuple[str, str, str, str]:
@@ -874,6 +1090,19 @@ def save_dashboard_preferences(prefs_path: Path, payload: dict[str, str]) -> Non
 
 def save_username_preference(prefs_path: Path, username: str) -> None:
     save_dashboard_preferences(prefs_path, {"last_username": username})
+
+
+def _load_strategy_profiles(preferences: dict[str, str]) -> tuple[str, ...]:
+    stored_profiles = preferences.get("strategy_profiles")
+    if stored_profiles:
+        return normalize_strategy_profiles(stored_profiles)
+    legacy_profile = preferences.get("strategy_profile", "MEDIUM")
+    return normalize_strategy_profiles((legacy_profile,))
+
+
+def _load_selected_assets(preferences: dict[str, str]) -> tuple[str, ...]:
+    stored_assets = preferences.get("selected_assets", "")
+    return tuple(asset.strip() for asset in stored_assets.split(",") if asset.strip())
 
 
 def _is_valid_float_input(value: str) -> bool:

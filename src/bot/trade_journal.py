@@ -318,6 +318,39 @@ class TradeJournalRepository:
         ).fetchall()
         return [self._row_to_broker_order(row) for row in rows]
 
+    def clear_binary_history(self, *, account_mode: str) -> int:
+        deleted_trade_ids = [
+            row["trade_id"]
+            for row in self._connection.execute(
+                "SELECT trade_id FROM trade_journal WHERE account_mode = ? AND instrument_type = ?",
+                (account_mode, InstrumentType.BINARY.value),
+            ).fetchall()
+        ]
+        if deleted_trade_ids:
+            placeholders = ",".join("?" for _ in deleted_trade_ids)
+            self._connection.execute(
+                f"DELETE FROM broker_orders WHERE trade_id IN ({placeholders})",
+                tuple(deleted_trade_ids),
+            )
+            self._connection.execute(
+                f"DELETE FROM trade_context_tags WHERE trade_id IN ({placeholders})",
+                tuple(deleted_trade_ids),
+            )
+            self._connection.execute(
+                f"DELETE FROM trade_journal WHERE trade_id IN ({placeholders})",
+                tuple(deleted_trade_ids),
+            )
+        self._connection.commit()
+        return len(deleted_trade_ids)
+
+    def clear_system_events(self, *, component: str | None = None) -> int:
+        if component is None:
+            cursor = self._connection.execute("DELETE FROM system_events")
+        else:
+            cursor = self._connection.execute("DELETE FROM system_events WHERE component = ?", (component,))
+        self._connection.commit()
+        return int(cursor.rowcount)
+
     def get_trade_tags(self, trade_id: str) -> dict[str, str]:
         rows = self._connection.execute(
             "SELECT tag_key, tag_value FROM trade_context_tags WHERE trade_id = ? ORDER BY tag_key",

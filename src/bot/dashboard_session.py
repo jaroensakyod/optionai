@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import math
 from pathlib import Path
 import threading
 import time
@@ -17,11 +18,13 @@ from .journal_service import JournalService
 from .models import InstrumentType, TradeResult
 from .runtime_logging import RuntimeEventLogger
 from .safety import StaleMarketDataGuard
-from .signal_engine import SimpleMomentumSignalEngine
+from .signal_engine import build_composite_signal_engine, normalize_strategy_profiles
 from .trade_journal import TradeJournalRepository
 
 
 _STALE_TRADE_GRACE_SEC = 120
+_MAX_ABNORMAL_OPEN_TRADE_SEC = 180
+_TRADE_RESULT_GRACE_SEC = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +38,7 @@ class SessionStopTargets:
 class SessionRunConfig:
     assets: tuple[str, ...]
     batch_size: int
+    strategy_profiles: tuple[str, ...]
     stake_amount: float
     timeframe_sec: int
     expiry_sec: int
@@ -72,6 +76,14 @@ class ReconcileSummary:
 @dataclass(frozen=True, slots=True)
 class ForceCloseSummary:
     closed_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PendingTradeResolution:
+    asset: str
+    trade_id: str
+    status: str
+    reason: str | None
 
 
 class DashboardSessionController:
@@ -151,7 +163,7 @@ class DashboardSessionController:
             repository=repository,
             journal_service=journal_service,
             market_data_provider=market_data_provider,
-            signal_engine=SimpleMomentumSignalEngine(),
+            signal_engine=build_composite_signal_engine(run_config.strategy_profiles),
             broker_adapter=broker_adapter,
             stale_data_guard=StaleMarketDataGuard(max_data_age_sec=max(run_config.timeframe_sec * 3, 180)),
             duplicate_signal_guard=duplicate_signal_guard,
@@ -163,17 +175,43 @@ class DashboardSessionController:
             market_data_provider.connect()
             broker_adapter.connect()
             baseline_balance = broker_adapter.get_balance()
+            effective_batch_size = _resolve_effective_batch_size(
+                batch_size=run_config.batch_size,
+                poll_interval_sec=run_config.poll_interval_sec,
+            )
             reconcile_open_practice_trades(
                 repository=repository,
                 journal_service=journal_service,
                 broker_adapter=broker_adapter,
                 event_logger=event_logger,
             )
+            pending_trades: dict[str, str] = {}
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status=None, baseline_balance=baseline_balance, status="running", last_reason=None, last_trade_id=None, target_mode=run_config.stop_targets.mode))
 
             while not self._stop_event.is_set():
-                round_started_at = datetime.now(UTC)
-                for asset_batch in _chunk_assets(run_config.assets, run_config.batch_size):
+                _sleep_until_next_scan_window(
+                    stop_event=self._stop_event,
+                    timeframe_sec=run_config.timeframe_sec,
+                    poll_interval_sec=run_config.poll_interval_sec,
+                )
+                if self._stop_event.is_set():
+                    break
+
+                resolved_trades = _poll_pending_session_trades(
+                    repository=repository,
+                    journal_service=journal_service,
+                    broker_adapter=broker_adapter,
+                    event_logger=event_logger,
+                    pending_trades=pending_trades,
+                )
+                for resolved_trade in resolved_trades:
+                    on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(resolved_trade.asset,), current_asset=resolved_trade.asset, last_run_status=resolved_trade.status, baseline_balance=baseline_balance, status="running", last_reason=resolved_trade.reason, last_trade_id=resolved_trade.trade_id, target_mode=run_config.stop_targets.mode))
+                    threshold_reason = check_stop_threshold(repository=repository, strategy_version_id=session_id, baseline_balance=baseline_balance, targets=run_config.stop_targets)
+                    if threshold_reason is not None:
+                        on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(resolved_trade.asset,), current_asset=resolved_trade.asset, last_run_status=resolved_trade.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=resolved_trade.trade_id, target_mode=run_config.stop_targets.mode))
+                        return
+
+                for asset_batch in _chunk_assets(run_config.assets, effective_batch_size):
                     if self._stop_event.is_set():
                         break
 
@@ -196,21 +234,9 @@ class DashboardSessionController:
                             )
                         )
                         batch_results.append((asset, result))
+                        if result.trade_id is not None:
+                            pending_trades[result.trade_id] = asset
                         on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, last_run_status=result.status, baseline_balance=baseline_balance, status="running", last_reason=result.reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
-
-                    for asset, result in batch_results:
-                        if result.trade_id is None:
-                            continue
-                        while not self._stop_event.is_set():
-                            closed_trade = broker_adapter.poll_trade_result(result.trade_id)
-                            if closed_trade is not None:
-                                break
-                            time.sleep(run_config.poll_interval_sec)
-
-                        threshold_reason = check_stop_threshold(repository=repository, strategy_version_id=session_id, baseline_balance=baseline_balance, targets=run_config.stop_targets)
-                        if threshold_reason is not None:
-                            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, last_run_status=result.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
-                            return
 
                     if batch_results:
                         last_asset, last_result = batch_results[-1]
@@ -219,16 +245,15 @@ class DashboardSessionController:
                             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(last_asset,), current_asset=last_asset, last_run_status=last_result.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=last_result.trade_id, target_mode=run_config.stop_targets.mode))
                             return
 
-                if self._stop_event.is_set():
-                    break
-
-                _sleep_until_next_scan_window(
-                    stop_event=self._stop_event,
-                    timeframe_sec=run_config.timeframe_sec,
-                    poll_interval_sec=run_config.poll_interval_sec,
-                    round_started_at=round_started_at,
-                )
-
+            resolved_trades = _poll_pending_session_trades(
+                repository=repository,
+                journal_service=journal_service,
+                broker_adapter=broker_adapter,
+                event_logger=event_logger,
+                pending_trades=pending_trades,
+            )
+            for resolved_trade in resolved_trades:
+                on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(resolved_trade.asset,), current_asset=resolved_trade.asset, last_run_status=resolved_trade.status, baseline_balance=baseline_balance, status="running", last_reason=resolved_trade.reason, last_trade_id=resolved_trade.trade_id, target_mode=run_config.stop_targets.mode))
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="stopped", baseline_balance=baseline_balance, status="stopped", last_reason="manual_stop", last_trade_id=None, target_mode=run_config.stop_targets.mode))
         except Exception as exc:
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="error", baseline_balance=baseline_balance, status="error", last_reason=type(exc).__name__, last_trade_id=None, target_mode=run_config.stop_targets.mode))
@@ -255,7 +280,7 @@ def reconcile_open_practice_trades(
         inspected_open_trades += 1
 
         age_sec = max((current_time - trade.opened_at_utc).total_seconds(), 0.0)
-        stale_after_sec = max(trade.expiry_sec, 0) + _STALE_TRADE_GRACE_SEC
+        stale_after_sec = min(max(trade.expiry_sec, 0) + _TRADE_RESULT_GRACE_SEC, _MAX_ABNORMAL_OPEN_TRADE_SEC)
         if age_sec < stale_after_sec:
             continue
 
@@ -311,6 +336,11 @@ def force_close_open_practice_trades(
     journal_service: JournalService,
     event_logger: RuntimeEventLogger,
     trade_ids: tuple[str, ...] | None = None,
+    close_reason: str = "forced_dashboard_close",
+    error_code: str = "FORCE_CLOSED",
+    error_message: str = "Trade was force-closed from the desktop dashboard because no real broker order remained open.",
+    event_type: str = "trade_force_closed",
+    event_message: str = "Force-closed an open practice trade from the desktop dashboard.",
 ) -> ForceCloseSummary:
     requested_trade_ids = set(trade_ids or ())
     closed_count = 0
@@ -324,18 +354,157 @@ def force_close_open_practice_trades(
             result=TradeResult.CANCELLED,
             profit_loss_abs=None,
             profit_loss_pct_risk=None,
-            close_reason="forced_dashboard_close",
-            error_code="FORCE_CLOSED",
-            error_message="Trade was force-closed from the desktop dashboard because no real broker order remained open.",
+            close_reason=close_reason,
+            error_code=error_code,
+            error_message=error_message,
         )
         closed_count += 1
         event_logger.log(
             severity="warning",
-            event_type="trade_force_closed",
-            message="Force-closed an open practice trade from the desktop dashboard.",
+            event_type=event_type,
+            message=event_message,
             details={"trade_id": trade.trade_id, "asset": trade.asset},
         )
     return ForceCloseSummary(closed_count=closed_count)
+
+
+def _force_close_abnormally_open_trade(
+    *,
+    repository: TradeJournalRepository,
+    journal_service: JournalService,
+    event_logger: RuntimeEventLogger,
+    trade_id: str,
+    now_utc: datetime | None = None,
+) -> bool:
+    trade = repository.get_trade(trade_id)
+    if trade is None or trade.closed_at_utc is not None:
+        return False
+    current_time = now_utc or datetime.now(UTC)
+    age_sec = max((current_time - trade.opened_at_utc).total_seconds(), 0.0)
+    if age_sec < _MAX_ABNORMAL_OPEN_TRADE_SEC:
+        return False
+    summary = force_close_open_practice_trades(
+        repository=repository,
+        journal_service=journal_service,
+        event_logger=event_logger,
+        trade_ids=(trade_id,),
+        close_reason="abnormal_open_timeout",
+        error_code="OPEN_TIMEOUT",
+        error_message="Trade remained open longer than three minutes and was closed locally during the dashboard session.",
+        event_type="trade_auto_closed_timeout",
+        event_message="Auto-closed a practice trade that remained open too long during the dashboard session.",
+    )
+    return summary.closed_count > 0
+
+
+def _force_close_expired_trade(
+    *,
+    repository: TradeJournalRepository,
+    journal_service: JournalService,
+    event_logger: RuntimeEventLogger,
+    trade_id: str,
+    now_utc: datetime | None = None,
+    error_message: str | None = None,
+) -> bool:
+    trade = repository.get_trade(trade_id)
+    if trade is None or trade.closed_at_utc is not None:
+        return False
+    current_time = now_utc or datetime.now(UTC)
+    age_sec = max((current_time - trade.opened_at_utc).total_seconds(), 0.0)
+    expiry_timeout_sec = max(trade.expiry_sec, 0) + _TRADE_RESULT_GRACE_SEC
+    if age_sec < expiry_timeout_sec:
+        return False
+    summary = force_close_open_practice_trades(
+        repository=repository,
+        journal_service=journal_service,
+        event_logger=event_logger,
+        trade_ids=(trade_id,),
+        close_reason="expiry_timeout",
+        error_code="BROKER_RESULT_TIMEOUT",
+        error_message=(
+            error_message
+            or "Trade reached expiry but no broker close result arrived in time during the dashboard session."
+        ),
+        event_type="trade_auto_closed_expiry_timeout",
+        event_message="Auto-closed a practice trade after expiry because no broker close result arrived in time.",
+    )
+    return summary.closed_count > 0
+
+
+def _poll_pending_session_trades(
+    *,
+    repository: TradeJournalRepository,
+    journal_service: JournalService,
+    broker_adapter: IQOptionAdapter,
+    event_logger: RuntimeEventLogger,
+    pending_trades: dict[str, str],
+) -> list[PendingTradeResolution]:
+    resolved_trades: list[PendingTradeResolution] = []
+    for trade_id, asset in tuple(pending_trades.items()):
+        try:
+            closed_trade = broker_adapter.poll_trade_result(trade_id)
+        except (IQOptionAdapterError, TypeError, ValueError) as exc:
+            event_logger.log(
+                severity="warning",
+                event_type="trade_result_poll_failed",
+                message="Failed to poll an open trade during the dashboard session.",
+                details={"trade_id": trade_id, "asset": asset, "reason": str(exc)},
+            )
+            if _force_close_expired_trade(
+                repository=repository,
+                journal_service=journal_service,
+                event_logger=event_logger,
+                trade_id=trade_id,
+                error_message=(
+                    "Trade reached expiry but broker polling kept failing during the dashboard session. "
+                    f"Last poll error: {exc}"
+                ),
+            ):
+                pending_trades.pop(trade_id, None)
+                resolved_trades.append(PendingTradeResolution(asset=asset, trade_id=trade_id, status="closed", reason="BROKER_RESULT_TIMEOUT"))
+                continue
+            if _force_close_abnormally_open_trade(
+                repository=repository,
+                journal_service=journal_service,
+                event_logger=event_logger,
+                trade_id=trade_id,
+            ):
+                pending_trades.pop(trade_id, None)
+                resolved_trades.append(PendingTradeResolution(asset=asset, trade_id=trade_id, status="closed", reason="OPEN_TIMEOUT"))
+            continue
+
+        if closed_trade is not None:
+            pending_trades.pop(trade_id, None)
+            resolved_trades.append(
+                PendingTradeResolution(
+                    asset=asset,
+                    trade_id=trade_id,
+                    status="closed",
+                    reason=closed_trade.result.value if closed_trade.result is not None else closed_trade.close_reason,
+                )
+            )
+            continue
+
+        if _force_close_expired_trade(
+            repository=repository,
+            journal_service=journal_service,
+            event_logger=event_logger,
+            trade_id=trade_id,
+        ):
+            pending_trades.pop(trade_id, None)
+            resolved_trades.append(PendingTradeResolution(asset=asset, trade_id=trade_id, status="closed", reason="BROKER_RESULT_TIMEOUT"))
+            continue
+
+        if _force_close_abnormally_open_trade(
+            repository=repository,
+            journal_service=journal_service,
+            event_logger=event_logger,
+            trade_id=trade_id,
+        ):
+            pending_trades.pop(trade_id, None)
+            resolved_trades.append(PendingTradeResolution(asset=asset, trade_id=trade_id, status="closed", reason="OPEN_TIMEOUT"))
+
+    return resolved_trades
 
 
 def check_stop_threshold(
@@ -411,15 +580,19 @@ def _chunk_assets(assets: tuple[str, ...], batch_size: int) -> tuple[tuple[str, 
     return tuple(tuple(assets[index : index + normalized_batch_size]) for index in range(0, len(assets), normalized_batch_size))
 
 
+def _resolve_effective_batch_size(*, batch_size: int, poll_interval_sec: float) -> int:
+    return batch_size
+
+
 def _sleep_until_next_scan_window(
     *,
     stop_event: threading.Event,
     timeframe_sec: int,
     poll_interval_sec: float,
-    round_started_at: datetime,
+    now_utc: datetime | None = None,
 ) -> None:
     delay_sec = _seconds_until_next_scan_window(
-        now_utc=round_started_at,
+        now_utc=now_utc or datetime.now(UTC),
         timeframe_sec=timeframe_sec,
         poll_interval_sec=poll_interval_sec,
     )
@@ -430,8 +603,11 @@ def _sleep_until_next_scan_window(
 
 def _seconds_until_next_scan_window(*, now_utc: datetime, timeframe_sec: int, poll_interval_sec: float) -> float:
     normalized_timeframe_sec = max(int(timeframe_sec), 1)
-    normalized_poll_sec = max(float(poll_interval_sec), 0.0)
+    raw_poll_sec = float(poll_interval_sec)
+    normalized_poll_sec = max(raw_poll_sec, 0.0) % normalized_timeframe_sec
     epoch_sec = now_utc.timestamp()
-    timeframe_boundary_sec = ((int(epoch_sec) // normalized_timeframe_sec) + 1) * normalized_timeframe_sec
+    timeframe_boundary_sec = math.floor(epoch_sec / normalized_timeframe_sec) * normalized_timeframe_sec
     target_time_utc = datetime.fromtimestamp(timeframe_boundary_sec, tz=UTC) + timedelta(seconds=normalized_poll_sec)
+    if epoch_sec > target_time_utc.timestamp():
+        target_time_utc += timedelta(seconds=normalized_timeframe_sec)
     return max((target_time_utc - now_utc).total_seconds(), 0.0)

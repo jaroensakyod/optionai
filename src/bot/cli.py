@@ -19,7 +19,7 @@ from .practice_harness import PracticeIntegrationHarness
 from .runtime_logging import RuntimeEventLogger
 from .safety import FileKillSwitch, ReconnectBackoffPolicy, StaleMarketDataGuard
 from .scheduler import BotScheduler, SchedulerConfig
-from .signal_engine import BlitzMomentumSignalEngine, SimpleMomentumSignalEngine
+from .signal_engine import build_signal_engine
 from .trade_journal import TradeJournalRepository
 
 
@@ -219,8 +219,8 @@ def _validate_args(args, assets: list[str], parser: argparse.ArgumentParser) -> 
 
 def _build_signal_engine(engine_name: str):
     if engine_name == "blitz":
-        return BlitzMomentumSignalEngine()
-    return SimpleMomentumSignalEngine()
+        return build_signal_engine("MEDIUM")
+    return build_signal_engine("LOW")
 
 
 def _build_market_data_provider(args, config):

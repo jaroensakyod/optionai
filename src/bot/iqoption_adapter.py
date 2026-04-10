@@ -16,6 +16,10 @@ class IQOptionAdapterError(RuntimeError):
     """Raised when the IQ Option adapter cannot complete an operation safely."""
 
 
+class IQOptionOrderUnavailableError(IQOptionAdapterError):
+    """Raised when an IQ Option asset cannot accept a new order right now."""
+
+
 @dataclass(frozen=True)
 class IQOptionCredentials:
     email: str
@@ -96,7 +100,7 @@ class IQOptionAdapter:
         profits = self._client.get_all_profit()
         payout = profits.get(signal_event.asset, {}).get("turbo")
         if payout is None:
-            raise IQOptionAdapterError(f"Payout unavailable for asset: {signal_event.asset}")
+            raise IQOptionOrderUnavailableError(f"Payout unavailable for asset: {signal_event.asset}")
         return float(payout)
 
     def submit_order(
@@ -157,15 +161,8 @@ class IQOptionAdapter:
         )
 
         if not status:
-            return self._journal_service.reject_trade(
-                trade_id=trade_id,
-                signal_event=signal_event,
-                strategy_version_id=strategy_version_id,
-                account_mode=self._config.app_mode,
-                error_code="BUY_FAILED",
-                error_message="broker returned unsuccessful buy response",
-                order_attempt=order_attempt,
-                tags=tags,
+            raise IQOptionOrderUnavailableError(
+                f"Broker rejected a new order for {signal_event.asset}; the pair is likely closed or temporarily unavailable."
             )
 
         return self._journal_service.open_trade(
@@ -219,14 +216,110 @@ class IQOptionAdapter:
         )
 
     def _poll_binary_result(self, broker_id: int) -> float | None:
-        for method_name in ("check_win_v4", "check_win_v3", "check_win_v2"):
-            method = getattr(self._client, method_name, None)
-            if method is None:
-                continue
-            value = method(broker_id)
-            if value is not None:
-                return float(value)
+        socket_value = self._poll_binary_result_from_socket(broker_id)
+        if socket_value is not None:
+            return socket_value
+
+        recent_closed_value = self._poll_binary_result_from_cached_recent_closed_options(broker_id)
+        if recent_closed_value is not None:
+            return recent_closed_value
+
+        if getattr(self._client, "api", None) is None:
+            for method_name in ("check_win_v4", "check_win_v3", "check_win_v2"):
+                method = getattr(self._client, method_name, None)
+                if method is None:
+                    continue
+                value = method(broker_id) if method_name != "check_win_v2" else method(broker_id, 0)
+                normalized_value = self._normalize_binary_poll_value(value)
+                if normalized_value is not None:
+                    return normalized_value
         return None
+
+    def _poll_binary_result_from_socket(self, broker_id: int) -> float | None:
+        api = getattr(self._client, "api", None)
+        if api is None:
+            return None
+        socket_option_closed = getattr(api, "socket_option_closed", None)
+        if not isinstance(socket_option_closed, dict):
+            return None
+        raw_value = socket_option_closed.get(broker_id)
+        if raw_value is None:
+            raw_value = socket_option_closed.get(str(broker_id))
+        return self._normalize_binary_poll_value(raw_value)
+
+    def _poll_binary_result_from_cached_recent_closed_options(self, broker_id: int) -> float | None:
+        api = getattr(self._client, "api", None)
+        if api is None:
+            return None
+        payload = getattr(api, "get_options_v2_data", None)
+        if not isinstance(payload, dict):
+            return None
+        message = payload.get("msg")
+        if not isinstance(message, dict):
+            return None
+        closed_options = message.get("closed_options")
+        if not isinstance(closed_options, list):
+            return None
+
+        for option in closed_options:
+            if not isinstance(option, dict):
+                continue
+            option_id = option.get("id")
+            if isinstance(option_id, list) and option_id:
+                option_id = option_id[0]
+            if option_id in {broker_id, str(broker_id)}:
+                return self._normalize_binary_poll_value((option.get("win"), self._profit_from_closed_option(option)))
+        return None
+
+    @classmethod
+    def _normalize_binary_poll_value(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, tuple) and len(value) >= 2:
+            profit_loss = value[1]
+            if profit_loss is None:
+                return None
+            return float(profit_loss)
+        if isinstance(value, dict):
+            message = value.get("msg")
+            if isinstance(message, dict):
+                return cls._profit_from_closed_option(message)
+            result = value.get("result")
+            if isinstance(result, dict):
+                data = result.get("data")
+                if isinstance(data, dict):
+                    for option_payload in data.values():
+                        if not isinstance(option_payload, dict):
+                            continue
+                        win = option_payload.get("win")
+                        if win in (None, ""):
+                            continue
+                        profit = option_payload.get("profit")
+                        deposit = option_payload.get("deposit")
+                        if profit is None or deposit is None:
+                            continue
+                        return float(profit) - float(deposit)
+        return None
+
+    @staticmethod
+    def _profit_from_closed_option(option_payload: dict[str, Any]) -> float | None:
+        win_state = option_payload.get("win")
+        if win_state in (None, ""):
+            return None
+        if win_state == "equal":
+            return 0.0
+        if win_state == "loose":
+            stake = option_payload.get("sum")
+            if stake is None:
+                return None
+            return float(stake) * -1.0
+        win_amount = option_payload.get("win_amount")
+        stake = option_payload.get("sum")
+        if win_amount is None or stake is None:
+            return None
+        return float(win_amount) - float(stake)
 
     def _set_practice_mode(self) -> None:
         self._require_connected()

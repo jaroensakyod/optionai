@@ -7,6 +7,7 @@ from src.bot.models import (
     SessionLabel,
     SignalEvent,
     StrategyVersion,
+    SystemEventRecord,
     TradeDirection,
     TradeJournalRecord,
     TradeResult,
@@ -95,4 +96,82 @@ def test_trade_repository_creates_parent_directory(tmp_path) -> None:
     assert database_path.parent.exists()
     assert database_path.exists()
 
+    repository.close()
+
+
+def test_trade_repository_can_clear_binary_history_and_system_events(tmp_path) -> None:
+    database_path = tmp_path / "trades.db"
+    schema_path = Path(__file__).resolve().parents[1] / "sql" / "001_initial_schema.sql"
+    repository = TradeJournalRepository.from_paths(database_path, schema_path)
+
+    created_at = datetime(2026, 4, 9, 12, 0, 0)
+    repository.save_strategy_version(
+        StrategyVersion(
+            strategy_version_id="clear-v1",
+            created_at_utc=created_at,
+            strategy_name="demo-strategy",
+            parameter_hash="clear-v1",
+            parameters={},
+            created_by="user",
+            approval_status="approved",
+        )
+    )
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="binary-1",
+            signal_id=None,
+            strategy_version_id="clear-v1",
+            opened_at_utc=created_at,
+            closed_at_utc=created_at,
+            asset="AUDCAD-OTC",
+            instrument_type=InstrumentType.BINARY,
+            timeframe_sec=60,
+            direction=TradeDirection.CALL,
+            amount=1.0,
+            expiry_sec=60,
+            account_mode="PRACTICE",
+            result=TradeResult.WIN,
+            profit_loss_abs=0.84,
+            profit_loss_pct_risk=0.84,
+        )
+    )
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="digital-1",
+            signal_id=None,
+            strategy_version_id="clear-v1",
+            opened_at_utc=created_at,
+            closed_at_utc=created_at,
+            asset="EURUSD",
+            instrument_type=InstrumentType.DIGITAL,
+            timeframe_sec=60,
+            direction=TradeDirection.CALL,
+            amount=1.0,
+            expiry_sec=60,
+            account_mode="PRACTICE",
+            result=TradeResult.WIN,
+            profit_loss_abs=0.8,
+            profit_loss_pct_risk=0.8,
+        )
+    )
+    repository.save_system_event(
+        SystemEventRecord(
+            event_id="evt-1",
+            occurred_at_utc=created_at,
+            severity="info",
+            component="desktop_session",
+            event_type="entry_window_wait",
+            message="waiting",
+            details={"reason": "awaiting_entry_window"},
+        )
+    )
+
+    deleted_trades = repository.clear_binary_history(account_mode="PRACTICE")
+    deleted_events = repository.clear_system_events(component="desktop_session")
+
+    remaining_trades = repository.list_trades(account_mode="PRACTICE")
+    assert deleted_trades == 1
+    assert deleted_events == 1
+    assert len(remaining_trades) == 1
+    assert remaining_trades[0].trade_id == "digital-1"
     repository.close()

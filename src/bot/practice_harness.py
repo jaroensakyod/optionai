@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import time
 from uuid import uuid4
 
-from .iqoption_adapter import IQOptionAdapter
+from .iqoption_adapter import IQOptionAdapter, IQOptionOrderUnavailableError
 from .iqoption_market_data import IQOptionMarketDataProvider
 from .models import InstrumentType, SessionLabel, SignalEvent, StrategyVersion, TradeDirection, TradeResult
 from .runtime_logging import RuntimeEventLogger
@@ -130,11 +130,20 @@ class PracticeIntegrationHarness:
                 "latest_candle_at_utc": candles[-1].opened_at_utc.isoformat() if candles else None,
             },
         )
-        trade = self._broker_adapter.submit_order(
-            signal_event=signal_event,
-            strategy_version_id=strategy_version_id,
-            tags={"probe": "practice_order", "signal_fingerprint": signal_event.signal_id},
-        )
+        try:
+            trade = self._broker_adapter.submit_order(
+                signal_event=signal_event,
+                strategy_version_id=strategy_version_id,
+                tags={"probe": "practice_order", "signal_fingerprint": signal_event.signal_id},
+            )
+        except IQOptionOrderUnavailableError as exc:
+            self._log(
+                severity="warning",
+                event_type="practice_order_probe_skipped",
+                message="Practice order probe skipped because the broker reported the pair as unavailable.",
+                details={"asset": asset, "instrument_type": instrument_type.value, "reason": str(exc)},
+            )
+            return PracticeOrderProbeResult(status="skipped", reason="market_closed_or_unavailable")
         self._log(
             severity="warning",
             event_type="practice_order_probe_submitted",

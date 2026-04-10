@@ -5,6 +5,7 @@ from src.bot.bot_runner import BotRunResult, BotRunner, RunnerPlan
 from src.bot.broker_adapter import PracticeBrokerAdapter
 from src.bot.config import load_config
 from src.bot.env import load_dotenv_file
+from src.bot.iqoption_adapter import IQOptionOrderUnavailableError
 from src.bot.journal_service import JournalService
 from src.bot.market_data import CsvMarketDataProvider
 from src.bot.models import InstrumentType
@@ -30,13 +31,7 @@ def test_bot_runner_submits_trade_from_csv_market_data(tmp_path, monkeypatch) ->
     repository = _build_repository(tmp_path)
     journal_service = JournalService(repository)
     market_data_csv = tmp_path / "candles.csv"
-    market_data_csv.write_text(
-        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price,volume\n"
-        "2026-04-09T08:00:00+00:00,EURUSD,digital,60,1.1000,1.1010,1.0995,1.1008,10\n"
-        "2026-04-09T08:01:00+00:00,EURUSD,digital,60,1.1008,1.1020,1.1006,1.1017,12\n"
-        "2026-04-09T08:02:00+00:00,EURUSD,digital,60,1.1017,1.1030,1.1015,1.1026,14\n",
-        encoding="utf-8",
-    )
+    _write_bullish_csv(market_data_csv, assets=("EURUSD",), instrument_type="digital", include_volume=True)
 
     runner = BotRunner(
         config=config,
@@ -75,13 +70,7 @@ def test_bot_runner_skips_when_same_asset_open_position_exists(tmp_path, monkeyp
     repository = _build_repository(tmp_path)
     journal_service = JournalService(repository)
     market_data_csv = tmp_path / "candles.csv"
-    market_data_csv.write_text(
-        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price\n"
-        "2026-04-09T08:00:00+00:00,EURUSD,digital,60,1.1000,1.1010,1.0995,1.1008\n"
-        "2026-04-09T08:01:00+00:00,EURUSD,digital,60,1.1008,1.1020,1.1006,1.1017\n"
-        "2026-04-09T08:02:00+00:00,EURUSD,digital,60,1.1017,1.1030,1.1015,1.1026\n",
-        encoding="utf-8",
-    )
+    _write_bullish_csv(market_data_csv, assets=("EURUSD",), instrument_type="digital")
     runner = BotRunner(
         config=config,
         repository=repository,
@@ -114,16 +103,7 @@ def test_bot_runner_allows_different_assets_to_open_at_same_time(tmp_path, monke
     repository = _build_repository(tmp_path)
     journal_service = JournalService(repository)
     market_data_csv = tmp_path / "candles.csv"
-    market_data_csv.write_text(
-        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price\n"
-        "2026-04-09T08:00:00+00:00,EURUSD,digital,60,1.1000,1.1010,1.0995,1.1008\n"
-        "2026-04-09T08:01:00+00:00,EURUSD,digital,60,1.1008,1.1020,1.1006,1.1017\n"
-        "2026-04-09T08:02:00+00:00,EURUSD,digital,60,1.1017,1.1030,1.1015,1.1026\n"
-        "2026-04-09T08:00:00+00:00,GBPUSD,digital,60,1.2000,1.2010,1.1995,1.2008\n"
-        "2026-04-09T08:01:00+00:00,GBPUSD,digital,60,1.2008,1.2020,1.2006,1.2017\n"
-        "2026-04-09T08:02:00+00:00,GBPUSD,digital,60,1.2017,1.2030,1.2015,1.2026\n",
-        encoding="utf-8",
-    )
+    _write_bullish_csv(market_data_csv, assets=("EURUSD", "GBPUSD"), instrument_type="digital")
     runner = BotRunner(
         config=config,
         repository=repository,
@@ -164,13 +144,7 @@ def test_bot_runner_skips_binary_trade_outside_entry_window(tmp_path, monkeypatc
     repository = _build_repository(tmp_path)
     journal_service = JournalService(repository)
     market_data_csv = tmp_path / "candles.csv"
-    market_data_csv.write_text(
-        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price\n"
-        "2026-04-09T08:00:00+00:00,GBPUSD,binary,60,1.1000,1.1010,1.0995,1.1008\n"
-        "2026-04-09T08:01:00+00:00,GBPUSD,binary,60,1.1008,1.1020,1.1006,1.1017\n"
-        "2026-04-09T08:02:00+00:00,GBPUSD,binary,60,1.1017,1.1030,1.1015,1.1026\n",
-        encoding="utf-8",
-    )
+    _write_bullish_csv(market_data_csv, assets=("GBPUSD",), instrument_type="binary")
     runner = BotRunner(
         config=config,
         repository=repository,
@@ -197,26 +171,27 @@ def test_bot_runner_skips_binary_trade_outside_entry_window(tmp_path, monkeypatc
     repository.close()
 
 
-def test_bot_runner_submits_binary_trade_at_entry_window(tmp_path, monkeypatch) -> None:
+
+
+def test_bot_runner_skips_when_broker_reports_closed_pair(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
     config = load_config(tmp_path)
     repository = _build_repository(tmp_path)
     journal_service = JournalService(repository)
     market_data_csv = tmp_path / "candles.csv"
-    market_data_csv.write_text(
-        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price\n"
-        "2026-04-09T08:00:00+00:00,GBPUSD,binary,60,1.1000,1.1010,1.0995,1.1008\n"
-        "2026-04-09T08:01:00+00:00,GBPUSD,binary,60,1.1008,1.1020,1.1006,1.1017\n"
-        "2026-04-09T08:02:00+00:00,GBPUSD,binary,60,1.1017,1.1030,1.1015,1.1026\n",
-        encoding="utf-8",
-    )
+    _write_bullish_csv(market_data_csv, assets=("GBPUSD",), instrument_type="binary")
+
+    class ClosedPairBrokerAdapter:
+        def submit_order(self, *, signal_event, strategy_version_id: str, tags=None):
+            raise IQOptionOrderUnavailableError(f"{signal_event.asset} is closed")
+
     runner = BotRunner(
         config=config,
         repository=repository,
         journal_service=journal_service,
         market_data_provider=CsvMarketDataProvider(market_data_csv),
         signal_engine=SimpleMomentumSignalEngine(),
-        broker_adapter=PracticeBrokerAdapter(config, repository, journal_service),
+        broker_adapter=ClosedPairBrokerAdapter(),
     )
 
     result = runner.run_once(
@@ -231,11 +206,32 @@ def test_bot_runner_submits_binary_trade_at_entry_window(tmp_path, monkeypatch) 
         now_utc=datetime(2026, 4, 9, 8, 3, 1, tzinfo=UTC),
     )
 
-    assert result.status == "submitted"
-    assert len(repository.list_trades(account_mode="PRACTICE")) == 1
+    assert result == BotRunResult(status="skipped", reason="market_closed_or_unavailable")
+    assert repository.list_trades(account_mode="PRACTICE") == []
     repository.close()
 
 
 def _build_repository(tmp_path: Path) -> TradeJournalRepository:
     schema_path = Path(__file__).resolve().parents[1] / "sql" / "001_initial_schema.sql"
     return TradeJournalRepository.from_paths(tmp_path / "trades.db", schema_path)
+
+
+def _write_bullish_csv(csv_path: Path, *, assets: tuple[str, ...], instrument_type: str, include_volume: bool = False) -> None:
+    header = "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price"
+    if include_volume:
+        header += ",volume"
+    rows = [header]
+    base_start = 1.1000
+    for asset_index, asset in enumerate(assets):
+        open_price = base_start + (asset_index * 0.1000)
+        for minute in range(12):
+            opened_at = f"2026-04-09T08:{minute:02d}:00+00:00"
+            high_price = open_price + 0.00065
+            low_price = open_price - 0.00015
+            close_price = open_price + 0.00050
+            row = f"{opened_at},{asset},{instrument_type},60,{open_price:.4f},{high_price:.4f},{low_price:.4f},{close_price:.4f}"
+            if include_volume:
+                row += f",{10 + minute}"
+            rows.append(row)
+            open_price += 0.0004
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")

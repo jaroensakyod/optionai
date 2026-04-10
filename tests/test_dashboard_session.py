@@ -6,7 +6,7 @@ import pytest
 from src.bot import dashboard_session
 from src.bot.bot_runner import BotRunResult
 from src.bot.config import RiskLimits
-from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, _chunk_assets, _seconds_until_next_scan_window, build_session_snapshot, check_stop_threshold, force_close_open_practice_trades, reconcile_open_practice_trades
+from src.bot.dashboard_session import DashboardSessionController, SessionRunConfig, SessionStopTargets, _chunk_assets, _force_close_abnormally_open_trade, _force_close_expired_trade, _resolve_effective_batch_size, _seconds_until_next_scan_window, build_session_snapshot, check_stop_threshold, force_close_open_practice_trades, reconcile_open_practice_trades
 from src.bot.journal_service import JournalService
 from src.bot.market_data import Candle
 from src.bot.models import InstrumentType, StrategyVersion, TradeDirection, TradeJournalRecord, TradeResult
@@ -159,7 +159,7 @@ def test_dashboard_session_checks_each_selected_asset_on_start(tmp_path, monkeyp
 
     monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
     monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
-    monkeypatch.setattr(dashboard_session, "SimpleMomentumSignalEngine", FakeSignalEngine)
+    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: FakeSignalEngine())
     monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
     monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
     monkeypatch.setattr(dashboard_session.time, "sleep", lambda _seconds: None)
@@ -168,6 +168,7 @@ def test_dashboard_session_checks_each_selected_asset_on_start(tmp_path, monkeyp
     run_config = SessionRunConfig(
         assets=("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"),
         batch_size=2,
+        strategy_profiles=("MEDIUM",),
         stake_amount=1.0,
         timeframe_sec=60,
         expiry_sec=60,
@@ -187,6 +188,212 @@ def test_dashboard_session_checks_each_selected_asset_on_start(tmp_path, monkeyp
     assert "AUDJPY-OTC" not in observed_update_assets
     assert "AUDCHF-OTC" in observed_update_assets
     assert updates[-1].status == "stopped"
+
+
+def test_dashboard_session_keeps_checking_other_assets_while_trade_is_open(tmp_path, monkeypatch) -> None:
+    root_dir = _build_runtime_root(tmp_path)
+    observed_assets: list[str] = []
+
+    class FakeMarketDataProvider:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config):
+            return cls()
+
+    class FakeBrokerAdapter:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config, _repository, _journal_service):
+            return cls()
+
+        def get_balance(self) -> float:
+            return 100.0
+
+        def poll_trade_result(self, _trade_id: str):
+            return None
+
+    class FakeEventLogger:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def log(self, **_kwargs) -> None:
+            return None
+
+    class FakeBotRunner:
+        def __init__(self, **kwargs):
+            self._repository = kwargs["repository"]
+            self._call_count = 0
+
+        def run_once(self, plan):
+            self._call_count += 1
+            observed_assets.append(plan.asset)
+            if self._call_count == 1:
+                opened_at = datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
+                _seed_strategy_version(self._repository, strategy_version_id=plan.strategy_version_id, created_at=opened_at)
+                self._repository.upsert_trade(
+                    TradeJournalRecord(
+                        trade_id="open-trade-1",
+                        signal_id=None,
+                        strategy_version_id=plan.strategy_version_id,
+                        opened_at_utc=opened_at,
+                        closed_at_utc=None,
+                        asset=plan.asset,
+                        instrument_type=plan.instrument_type,
+                        timeframe_sec=plan.timeframe_sec,
+                        direction=TradeDirection.CALL,
+                        amount=plan.stake_amount,
+                        expiry_sec=plan.expiry_sec,
+                        account_mode="PRACTICE",
+                        broker_order_id="order-open-trade-1",
+                        broker_position_id="position-open-trade-1",
+                    )
+                )
+                return BotRunResult(status="submitted", trade_id="open-trade-1")
+            controller.stop()
+            return BotRunResult(status="skipped", reason="no_signal")
+
+    monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
+    monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
+    monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
+    monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
+    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: object())
+    monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
+
+    controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
+    run_config = SessionRunConfig(
+        assets=("AUDCAD-OTC", "AUDCHF-OTC"),
+        batch_size=2,
+        strategy_profiles=("MEDIUM",),
+        stake_amount=1.0,
+        timeframe_sec=60,
+        expiry_sec=60,
+        poll_interval_sec=0.01,
+        stop_targets=SessionStopTargets(mode="$", profit_target=0.0, loss_limit=0.0),
+    )
+
+    controller._run_session("session-open-trade", run_config, lambda _snapshot: None)
+
+    assert observed_assets == ["AUDCAD-OTC", "AUDCHF-OTC"]
+
+
+def test_dashboard_session_records_closed_trade_result_on_next_poll_cycle(tmp_path, monkeypatch) -> None:
+    root_dir = _build_runtime_root(tmp_path)
+
+    class FakeMarketDataProvider:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config):
+            return cls()
+
+    class FakeBrokerAdapter:
+        def __init__(self, repository):
+            self._repository = repository
+            self._poll_calls = 0
+
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config, repository, _journal_service):
+            return cls(repository)
+
+        def get_balance(self) -> float:
+            return 100.0
+
+        def poll_trade_result(self, trade_id: str):
+            self._poll_calls += 1
+            if self._poll_calls == 1:
+                return None
+            trade = self._repository.get_trade(trade_id)
+            if trade is None:
+                return None
+            closed_trade = trade if trade.closed_at_utc is not None else None
+            if closed_trade is not None:
+                return closed_trade
+            journal_service = JournalService(self._repository)
+            return journal_service.close_trade(
+                trade_id=trade_id,
+                result=TradeResult.WIN,
+                profit_loss_abs=0.82,
+                profit_loss_pct_risk=0.82,
+                close_reason="broker_poll",
+            )
+
+    class FakeEventLogger:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def log(self, **_kwargs) -> None:
+            return None
+
+    class FakeBotRunner:
+        def __init__(self, **kwargs):
+            self._repository = kwargs["repository"]
+            self._run_count = 0
+
+        def run_once(self, plan):
+            self._run_count += 1
+            if self._run_count == 1:
+                opened_at = datetime(2026, 4, 10, 12, 0, tzinfo=UTC)
+                _seed_strategy_version(self._repository, strategy_version_id=plan.strategy_version_id, created_at=opened_at)
+                self._repository.upsert_trade(
+                    TradeJournalRecord(
+                        trade_id="result-trade-1",
+                        signal_id=None,
+                        strategy_version_id=plan.strategy_version_id,
+                        opened_at_utc=opened_at,
+                        closed_at_utc=None,
+                        asset=plan.asset,
+                        instrument_type=plan.instrument_type,
+                        timeframe_sec=plan.timeframe_sec,
+                        direction=TradeDirection.CALL,
+                        amount=plan.stake_amount,
+                        expiry_sec=plan.expiry_sec,
+                        account_mode="PRACTICE",
+                        broker_order_id="order-result-trade-1",
+                        broker_position_id="position-result-trade-1",
+                    )
+                )
+                return BotRunResult(status="submitted", trade_id="result-trade-1")
+            controller.stop()
+            return BotRunResult(status="skipped", reason="no_signal")
+
+    monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
+    monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
+    monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
+    monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
+    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: object())
+    monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
+
+    controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
+    run_config = SessionRunConfig(
+        assets=("AUDCAD-OTC",),
+        batch_size=1,
+        strategy_profiles=("MEDIUM",),
+        stake_amount=1.0,
+        timeframe_sec=60,
+        expiry_sec=60,
+        poll_interval_sec=0.01,
+        stop_targets=SessionStopTargets(mode="$", profit_target=0.0, loss_limit=0.0),
+    )
+    updates: list[object] = []
+
+    controller._run_session("session-close-result", run_config, updates.append)
+
+    repository = TradeJournalRepository.from_paths(root_dir / "data" / "trades.db", root_dir / "sql" / "001_initial_schema.sql")
+    updated_trade = repository.get_trade("result-trade-1")
+    assert updated_trade is not None
+    assert updated_trade.result == TradeResult.WIN
+    assert updated_trade.profit_loss_abs == pytest.approx(0.82)
+    assert any(snapshot.last_trade_id == "result-trade-1" and snapshot.last_run_status == "closed" and snapshot.last_reason == "WIN" for snapshot in updates)
+    assert any(snapshot.closed_trades == 1 and snapshot.wins == 1 and snapshot.net_pnl == pytest.approx(0.82) for snapshot in updates)
+    repository.close()
 
 
 def test_reconcile_open_practice_trades_closes_unresolved_stale_trade(tmp_path) -> None:
@@ -302,6 +509,58 @@ def test_reconcile_open_practice_trades_leaves_fresh_trade_open(tmp_path) -> Non
     repository.close()
 
 
+def test_reconcile_open_practice_trades_closes_trade_older_than_three_minutes_even_with_long_expiry(tmp_path) -> None:
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    opened_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
+    _seed_strategy_version(repository, strategy_version_id="session-long-expiry", created_at=opened_at)
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="long-expiry-trade",
+            signal_id=None,
+            strategy_version_id="session-long-expiry",
+            opened_at_utc=opened_at,
+            closed_at_utc=None,
+            asset="AUDJPY-OTC",
+            instrument_type=InstrumentType.BINARY,
+            timeframe_sec=60,
+            direction=TradeDirection.CALL,
+            amount=1.0,
+            expiry_sec=600,
+            account_mode="PRACTICE",
+            broker_order_id="order-long-expiry",
+            broker_position_id="position-long-expiry",
+        )
+    )
+
+    class FakeBrokerAdapter:
+        def poll_trade_result(self, _trade_id: str):
+            return None
+
+    class FakeEventLogger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    event_logger = FakeEventLogger()
+
+    reconcile_open_practice_trades(
+        repository=repository,
+        journal_service=journal_service,
+        broker_adapter=FakeBrokerAdapter(),
+        event_logger=event_logger,
+        now_utc=datetime(2026, 4, 9, 12, 3, 1, tzinfo=UTC),
+    )
+
+    updated_trade = repository.get_trade("long-expiry-trade")
+    assert updated_trade is not None
+    assert updated_trade.closed_at_utc is not None
+    assert updated_trade.error_code == "STALE_OPEN_TRADE"
+    repository.close()
+
+
 def test_force_close_open_practice_trades_closes_requested_rows(tmp_path) -> None:
     repository = _build_repository(tmp_path)
     journal_service = JournalService(repository)
@@ -353,11 +612,212 @@ def test_force_close_open_practice_trades_closes_requested_rows(tmp_path) -> Non
     repository.close()
 
 
+def test_force_close_abnormally_open_trade_marks_timeout_reason(tmp_path) -> None:
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    opened_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
+    _seed_strategy_version(repository, strategy_version_id="session-auto-close", created_at=opened_at)
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="auto-close-trade",
+            signal_id=None,
+            strategy_version_id="session-auto-close",
+            opened_at_utc=opened_at,
+            closed_at_utc=None,
+            asset="AUDCHF-OTC",
+            instrument_type=InstrumentType.BINARY,
+            timeframe_sec=60,
+            direction=TradeDirection.CALL,
+            amount=1.0,
+            expiry_sec=60,
+            account_mode="PRACTICE",
+            broker_order_id="order-auto-close",
+            broker_position_id="position-auto-close",
+        )
+    )
+
+    class FakeEventLogger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    event_logger = FakeEventLogger()
+
+    was_closed = _force_close_abnormally_open_trade(
+        repository=repository,
+        journal_service=journal_service,
+        event_logger=event_logger,
+        trade_id="auto-close-trade",
+        now_utc=datetime(2026, 4, 9, 12, 3, 1, tzinfo=UTC),
+    )
+
+    updated_trade = repository.get_trade("auto-close-trade")
+    assert was_closed is True
+    assert updated_trade is not None and updated_trade.close_reason == "abnormal_open_timeout"
+    assert updated_trade.error_code == "OPEN_TIMEOUT"
+    assert [event["event_type"] for event in event_logger.events] == ["trade_auto_closed_timeout"]
+    repository.close()
+
+
+def test_force_close_expired_trade_marks_broker_result_timeout(tmp_path) -> None:
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+    opened_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
+    _seed_strategy_version(repository, strategy_version_id="session-expiry-timeout", created_at=opened_at)
+    repository.upsert_trade(
+        TradeJournalRecord(
+            trade_id="expiry-timeout-trade",
+            signal_id=None,
+            strategy_version_id="session-expiry-timeout",
+            opened_at_utc=opened_at,
+            closed_at_utc=None,
+            asset="AUDUSD-OTC",
+            instrument_type=InstrumentType.BINARY,
+            timeframe_sec=60,
+            direction=TradeDirection.PUT,
+            amount=1.0,
+            expiry_sec=60,
+            account_mode="PRACTICE",
+            broker_order_id="order-expiry-timeout",
+            broker_position_id="position-expiry-timeout",
+        )
+    )
+
+    class FakeEventLogger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    event_logger = FakeEventLogger()
+
+    was_closed = _force_close_expired_trade(
+        repository=repository,
+        journal_service=journal_service,
+        event_logger=event_logger,
+        trade_id="expiry-timeout-trade",
+        now_utc=datetime(2026, 4, 9, 12, 1, 16, tzinfo=UTC),
+    )
+
+    updated_trade = repository.get_trade("expiry-timeout-trade")
+    assert was_closed is True
+    assert updated_trade is not None and updated_trade.close_reason == "expiry_timeout"
+    assert updated_trade.error_code == "BROKER_RESULT_TIMEOUT"
+    assert [event["event_type"] for event in event_logger.events] == ["trade_auto_closed_expiry_timeout"]
+    repository.close()
+
+
+def test_dashboard_session_survives_poll_errors_and_closes_expired_trade(tmp_path, monkeypatch) -> None:
+    root_dir = _build_runtime_root(tmp_path)
+
+    class FakeMarketDataProvider:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config):
+            return cls()
+
+    class FakeBrokerAdapter:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config, _repository, _journal_service):
+            return cls()
+
+        def get_balance(self) -> float:
+            return 100.0
+
+        def poll_trade_result(self, _trade_id: str):
+            raise ValueError("broker polling failed")
+
+    class FakeEventLogger:
+        def __init__(self, *_args, **_kwargs):
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    class FakeBotRunner:
+        def __init__(self, **kwargs):
+            self._repository = kwargs["repository"]
+            self._journal_service = kwargs["journal_service"]
+            self._submitted = False
+
+        def run_once(self, plan):
+            if self._submitted:
+                controller.stop()
+                return BotRunResult(status="skipped", reason="no_signal")
+            self._submitted = True
+            opened_at = datetime(2026, 4, 9, 12, 0, tzinfo=UTC)
+            _seed_strategy_version(self._repository, strategy_version_id=plan.strategy_version_id, created_at=opened_at)
+            self._repository.upsert_trade(
+                TradeJournalRecord(
+                    trade_id="session-poll-trade",
+                    signal_id=None,
+                    strategy_version_id=plan.strategy_version_id,
+                    opened_at_utc=opened_at,
+                    closed_at_utc=None,
+                    asset=plan.asset,
+                    instrument_type=plan.instrument_type,
+                    timeframe_sec=plan.timeframe_sec,
+                    direction=TradeDirection.CALL,
+                    amount=plan.stake_amount,
+                    expiry_sec=plan.expiry_sec,
+                    account_mode="PRACTICE",
+                    broker_order_id="order-session-poll",
+                    broker_position_id="position-session-poll",
+                )
+            )
+            return BotRunResult(status="submitted", trade_id="session-poll-trade")
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 4, 9, 12, 1, 16, tzinfo=tz or UTC)
+
+    monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
+    monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
+    monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
+    monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
+    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: object())
+    monkeypatch.setattr(dashboard_session, "datetime", FrozenDateTime)
+    monkeypatch.setattr(dashboard_session.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
+
+    controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
+    run_config = SessionRunConfig(
+        assets=("AUDCAD-OTC",),
+        batch_size=1,
+        strategy_profiles=("MEDIUM",),
+        stake_amount=1.0,
+        timeframe_sec=60,
+        expiry_sec=60,
+        poll_interval_sec=0.01,
+        stop_targets=SessionStopTargets(mode="$", profit_target=0.0, loss_limit=0.0),
+    )
+    updates: list[object] = []
+
+    controller._run_session("session-poll-errors", run_config, updates.append)
+
+    repository = TradeJournalRepository.from_paths(root_dir / "data" / "trades.db", root_dir / "sql" / "001_initial_schema.sql")
+    updated_trade = repository.get_trade("session-poll-trade")
+    assert updated_trade is not None
+    assert updated_trade.close_reason == "expiry_timeout"
+    assert updated_trade.error_code == "BROKER_RESULT_TIMEOUT"
+    assert all(snapshot.status != "error" for snapshot in updates)
+    repository.close()
+
+
 def test_chunk_assets_returns_single_full_round_for_all_mode() -> None:
     assert _chunk_assets(("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"), 0) == (("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"),)
 
 
-def test_seconds_until_next_scan_window_starts_from_candle_close_boundary() -> None:
+def test_seconds_until_next_scan_window_starts_from_poll_offset_after_boundary() -> None:
     delay = _seconds_until_next_scan_window(
         now_utc=datetime(2026, 4, 10, 12, 0, 30, tzinfo=UTC),
         timeframe_sec=60,
@@ -375,6 +835,58 @@ def test_seconds_until_next_scan_window_rolls_to_next_candle_when_offset_passed(
     )
 
     assert delay == pytest.approx(59.0)
+
+
+def test_seconds_until_next_scan_window_uses_current_candle_when_offset_not_reached_yet() -> None:
+    delay = _seconds_until_next_scan_window(
+        now_utc=datetime(2026, 4, 10, 12, 1, 3, tzinfo=UTC),
+        timeframe_sec=60,
+        poll_interval_sec=5.0,
+    )
+
+    assert delay == pytest.approx(2.0)
+
+
+def test_seconds_until_next_scan_window_wraps_poll_offset_to_timeframe() -> None:
+    delay = _seconds_until_next_scan_window(
+        now_utc=datetime(2026, 4, 10, 12, 0, 30, tzinfo=UTC),
+        timeframe_sec=60,
+        poll_interval_sec=60.0,
+    )
+
+    assert delay == pytest.approx(30.0)
+
+
+def test_seconds_until_next_scan_window_uses_zero_offset_when_poll_is_zero() -> None:
+    delay = _seconds_until_next_scan_window(
+        now_utc=datetime(2026, 4, 10, 12, 0, 30, tzinfo=UTC),
+        timeframe_sec=60,
+        poll_interval_sec=0.0,
+    )
+
+    assert delay == pytest.approx(30.0)
+
+
+def test_seconds_until_next_scan_window_rolls_to_next_candle_after_zero_offset() -> None:
+    delay = _seconds_until_next_scan_window(
+        now_utc=datetime(2026, 4, 10, 12, 0, 58, tzinfo=UTC),
+        timeframe_sec=60,
+        poll_interval_sec=0.0,
+    )
+
+    assert delay == pytest.approx(2.0)
+
+
+def test_resolve_effective_batch_size_preserves_all_mode_when_poll_offset_is_zero() -> None:
+    assert _resolve_effective_batch_size(batch_size=0, poll_interval_sec=0.0) == 0
+
+
+def test_resolve_effective_batch_size_preserves_large_batches_when_poll_offset_is_zero() -> None:
+    assert _resolve_effective_batch_size(batch_size=12, poll_interval_sec=0.0) == 12
+
+
+def test_resolve_effective_batch_size_preserves_batch_when_poll_offset_is_positive() -> None:
+    assert _resolve_effective_batch_size(batch_size=12, poll_interval_sec=5.0) == 12
 
 
 def _build_repository(tmp_path: Path) -> TradeJournalRepository:

@@ -251,10 +251,10 @@ def test_practice_integration_harness_order_probe_reports_rejected_trade(tmp_pat
     )
 
     events = repository.list_system_events(component="runner")
-    assert result.status == "rejected"
-    assert result.result == "REJECTED"
-    assert result.reason == "BUY_FAILED"
-    assert any(event.event_type == "practice_order_probe_rejected" for event in events)
+    assert result.status == "skipped"
+    assert result.result is None
+    assert result.reason == "market_closed_or_unavailable"
+    assert any(event.event_type == "practice_order_probe_skipped" for event in events)
     repository.close()
 
 

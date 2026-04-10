@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from .config import AppConfig
 from .iqoption_adapter import IQOptionAdapterError, IQOptionCredentials
-from .models import InstrumentType, MetricSnapshot, TradeJournalRecord
+from .models import InstrumentType, MetricSnapshot, SessionLabel, TradeContextRecord, TradeJournalRecord
 from .stats_service import build_metric_snapshot
 from .trade_journal import TradeJournalRepository
 
@@ -22,6 +22,7 @@ class BinaryPairStatus:
     asset: str
     payout: float | None
     is_open: bool
+    is_supported: bool
     trade_count: int
     win_rate_pct: float
     net_pnl: float
@@ -43,6 +44,7 @@ class TradeHistoryRow:
     amount: float
     profit_loss_abs: float | None
     payout_snapshot: float | None
+    strategy_display: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,24 @@ class DashboardSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class StrategyAnalyticsRow:
+    strategy_display: str
+    group_value: str
+    trades: int
+    wins: int
+    losses: int
+    win_rate_pct: float
+    net_pnl: float
+    profit_factor: float
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyAnalyticsSnapshot:
+    by_asset: tuple[StrategyAnalyticsRow, ...]
+    by_session: tuple[StrategyAnalyticsRow, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LocalSelectionView:
     selected_assets: tuple[str, ...]
     selected_asset_metrics: MetricSnapshot
@@ -94,6 +114,7 @@ class IQOptionDashboardService:
         self._client_factory = client_factory or self._default_client_factory
         self._client: Any | None = None
         self._selected_account_mode = "PRACTICE"
+        self._actives_refreshed = False
 
     @classmethod
     def from_environment(
@@ -122,6 +143,7 @@ class IQOptionDashboardService:
             raise IQOptionAdapterError(f"IQ Option dashboard connect failed: {reason}")
         client.change_balance(self._selected_account_mode)
         self._client = client
+        self._actives_refreshed = False
 
     @property
     def selected_account_mode(self) -> str:
@@ -151,6 +173,7 @@ class IQOptionDashboardService:
             except Exception:
                 pass
         self._client = None
+        self._actives_refreshed = False
 
     def is_connected(self) -> bool:
         return self._client is not None and bool(self._client.check_connect())
@@ -165,6 +188,7 @@ class IQOptionDashboardService:
         if not status:
             raise IQOptionAdapterError(f"IQ Option dashboard reconnect failed: {reason}")
         self._client.change_balance(self._selected_account_mode)
+        self._actives_refreshed = False
         return True
 
     def load_snapshot(self, *, selected_assets: tuple[str, ...] | None = None, history_limit: int = 20) -> DashboardSnapshot:
@@ -190,10 +214,29 @@ class IQOptionDashboardService:
             block_reason=self._build_block_reason(open_positions),
         )
 
+    def build_strategy_analytics_snapshot(self) -> StrategyAnalyticsSnapshot:
+        trade_contexts = [
+            context
+            for context in self._repository.list_trade_contexts(account_mode=self._selected_account_mode)
+            if context.trade.instrument_type == InstrumentType.BINARY
+            and _is_otc_asset(context.trade.asset)
+            and context.trade.closed_at_utc is not None
+        ]
+        return StrategyAnalyticsSnapshot(
+            by_asset=tuple(self._build_strategy_analytics_rows(trade_contexts, group_by="asset")),
+            by_session=tuple(self._build_strategy_analytics_rows(trade_contexts, group_by="session")),
+        )
+
+    def clear_binary_history(self) -> int:
+        deleted_trades = self._repository.clear_binary_history(account_mode=self._selected_account_mode)
+        self._repository.clear_system_events(component="desktop_session")
+        return deleted_trades
+
     def list_open_binary_pairs(self) -> tuple[BinaryPairStatus, ...]:
         self.reconnect_if_needed()
         refreshed_at = datetime.now(UTC)
         profits = self._safe_get_all_profit()
+        supported_assets = self._supported_binary_assets()
         metrics_by_asset = self._build_metrics_by_asset()
         statuses: list[BinaryPairStatus] = []
 
@@ -203,15 +246,25 @@ class IQOptionDashboardService:
             payout = _extract_payout(profits, asset)
             if payout is None:
                 continue
-            statuses.append(self._build_pair_status(asset=asset, payout=payout, metrics_by_asset=metrics_by_asset, refreshed_at=refreshed_at))
+            statuses.append(
+                self._build_pair_status(
+                    asset=asset,
+                    payout=payout,
+                    metrics_by_asset=metrics_by_asset,
+                    refreshed_at=refreshed_at,
+                    is_supported=supported_assets is None or asset in supported_assets,
+                )
+            )
 
         ranked = sorted(statuses, key=_pair_sort_key)
-        recommended_assets = {pair.asset for pair in ranked[:3]}
+        recommended_assets = {pair.asset for pair in ranked if pair.is_supported and pair.is_open}
+        recommended_assets = set(list(recommended_assets)[:3])
         return tuple(
             BinaryPairStatus(
                 asset=pair.asset,
                 payout=pair.payout,
                 is_open=pair.is_open,
+                is_supported=pair.is_supported,
                 trade_count=pair.trade_count,
                 win_rate_pct=pair.win_rate_pct,
                 net_pnl=pair.net_pnl,
@@ -309,6 +362,7 @@ class IQOptionDashboardService:
         payout: float | None,
         metrics_by_asset: dict[str, MetricSnapshot],
         refreshed_at: datetime,
+        is_supported: bool,
     ) -> BinaryPairStatus:
         metrics = metrics_by_asset.get(asset) or build_metric_snapshot([])
         total_trades = metrics.total_trades
@@ -318,6 +372,7 @@ class IQOptionDashboardService:
             asset=asset,
             payout=payout,
             is_open=True,
+            is_supported=is_supported,
             trade_count=total_trades,
             win_rate_pct=win_rate_pct,
             net_pnl=metrics.net_pnl,
@@ -326,8 +381,7 @@ class IQOptionDashboardService:
             opportunity_updated_at_utc=refreshed_at.isoformat(),
         )
 
-    @staticmethod
-    def _build_trade_history_rows(trades: list[TradeJournalRecord]) -> list[TradeHistoryRow]:
+    def _build_trade_history_rows(self, trades: list[TradeJournalRecord]) -> list[TradeHistoryRow]:
         rows: list[TradeHistoryRow] = []
         for trade in reversed(trades):
             rows.append(
@@ -341,15 +395,101 @@ class IQOptionDashboardService:
                     amount=trade.amount,
                     profit_loss_abs=trade.profit_loss_abs,
                     payout_snapshot=trade.payout_snapshot,
+                    strategy_display=self._strategy_display_for_trade(trade),
                 )
             )
         return rows
+
+    def _strategy_display_for_trade(self, trade: TradeJournalRecord) -> str:
+        tags = self._repository.get_trade_tags(trade.trade_id)
+        display = tags.get("strategy_display")
+        if display:
+            return display
+        profiles = [profile for profile in tags.get("strategy_profiles", "").split(",") if profile]
+        if profiles:
+            return " + ".join(profiles)
+        fallback_profile = tags.get("strategy_profile")
+        if fallback_profile:
+            return fallback_profile
+        return "UNKNOWN"
+
+    def _build_strategy_analytics_rows(
+        self,
+        trade_contexts: list[TradeContextRecord],
+        *,
+        group_by: str,
+    ) -> list[StrategyAnalyticsRow]:
+        grouped: dict[tuple[str, str], list[TradeJournalRecord]] = {}
+        for context in trade_contexts:
+            strategy_displays = self._strategy_groups_for_trade(context.trade)
+            if group_by == "asset":
+                group_value = context.trade.asset
+            else:
+                group_value = _format_session_label(context.session_label)
+            for strategy_display in strategy_displays:
+                grouped.setdefault((strategy_display, group_value), []).append(context.trade)
+        rows: list[StrategyAnalyticsRow] = []
+        for (strategy_display, group_value), trades in grouped.items():
+            metrics = build_metric_snapshot(trades)
+            total_trades = metrics.total_trades
+            if total_trades <= 0:
+                continue
+            win_rate_pct = 0.0 if total_trades == 0 else (metrics.wins / total_trades) * 100.0
+            rows.append(
+                StrategyAnalyticsRow(
+                    strategy_display=strategy_display,
+                    group_value=group_value,
+                    trades=total_trades,
+                    wins=metrics.wins,
+                    losses=metrics.losses,
+                    win_rate_pct=win_rate_pct,
+                    net_pnl=metrics.net_pnl,
+                    profit_factor=metrics.profit_factor,
+                )
+            )
+        return sorted(rows, key=lambda row: (-row.net_pnl, -row.win_rate_pct, row.strategy_display, row.group_value))
+
+    def _strategy_groups_for_trade(self, trade: TradeJournalRecord) -> tuple[str, ...]:
+        tags = self._repository.get_trade_tags(trade.trade_id)
+        profiles = tuple(profile for profile in tags.get("strategy_profiles", "").split(",") if profile)
+        if profiles:
+            return profiles
+        profile = tags.get("strategy_profile")
+        if profile:
+            return (profile,)
+        display = tags.get("strategy_display")
+        if display:
+            return (display,)
+        return ()
 
     def _safe_get_all_profit(self) -> dict[str, dict[str, float | None]]:
         profits = self._client.get_all_profit()
         if not isinstance(profits, dict):
             return {}
         return profits
+
+    def _supported_binary_assets(self) -> set[str] | None:
+        getter = getattr(self._client, "get_all_ACTIVES_OPCODE", None)
+        if not callable(getter):
+            getter = getattr(self._client, "get_ALL_Binary_ACTIVES_OPCODE", None)
+        if not callable(getter):
+            return None
+        if not self._actives_refreshed:
+            updater = getattr(self._client, "update_ACTIVES_OPCODE", None)
+            if callable(updater):
+                try:
+                    updater()
+                except Exception:
+                    pass
+            self._actives_refreshed = True
+        try:
+            payload = getter()
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        supported_assets = {asset for asset in payload if isinstance(asset, str)}
+        return supported_assets or None
 
     @staticmethod
     def _default_client_factory(email: str, password: str) -> Any:
@@ -384,9 +524,10 @@ def _is_otc_asset(asset: str) -> bool:
     return asset.endswith("-OTC")
 
 
-def _pair_sort_key(pair: BinaryPairStatus) -> tuple[float, float, float, str]:
+def _pair_sort_key(pair: BinaryPairStatus) -> tuple[float, float, float, float, str]:
     payout_score = pair.payout or 0.0
-    return (-payout_score, -pair.win_rate_pct, -pair.trade_count, pair.asset)
+    unsupported_rank = 1.0 if not pair.is_supported else 0.0
+    return (unsupported_rank, -payout_score, -pair.win_rate_pct, -pair.trade_count, pair.asset)
 
 
 def _recommendation_reason(pair: BinaryPairStatus) -> str:
@@ -423,16 +564,17 @@ def _opportunity_band(opportunity_score_pct: float) -> str:
 
 
 def _normalize_selected_assets(selected_assets: tuple[str, ...] | None, binary_pairs: tuple[BinaryPairStatus, ...]) -> tuple[str, ...]:
-    open_assets = {pair.asset for pair in binary_pairs}
+    open_assets = {pair.asset for pair in binary_pairs if pair.is_supported}
     requested = tuple(asset for asset in (selected_assets or ()) if asset in open_assets)
     if requested:
         return requested
-    recommended = tuple(pair.asset for pair in binary_pairs if pair.is_recommended)
-    if recommended:
-        return recommended
-    if binary_pairs:
-        return (binary_pairs[0].asset,)
-    return ()
+    return tuple(sorted(open_assets))
+
+
+def _format_session_label(session_label: SessionLabel | None) -> str:
+    if session_label is None:
+        return "UNKNOWN"
+    return session_label.value.upper()
 
 
 def _normalize_account_mode(account_mode: str) -> str:
