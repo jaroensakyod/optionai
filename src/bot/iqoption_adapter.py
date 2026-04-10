@@ -220,6 +220,10 @@ class IQOptionAdapter:
         if socket_value is not None:
             return socket_value
 
+        async_order_value = self._poll_binary_result_from_async_order(broker_id)
+        if async_order_value is not None:
+            return async_order_value
+
         recent_closed_value = self._poll_binary_result_from_cached_recent_closed_options(broker_id)
         if recent_closed_value is not None:
             return recent_closed_value
@@ -234,6 +238,28 @@ class IQOptionAdapter:
                 if normalized_value is not None:
                     return normalized_value
         return None
+
+    def _poll_binary_result_from_async_order(self, broker_id: int) -> float | None:
+        get_async_order = getattr(self._client, "get_async_order", None)
+        if not callable(get_async_order):
+            return None
+        try:
+            async_order = get_async_order(broker_id)
+        except Exception:
+            return None
+        if not isinstance(async_order, dict):
+            return None
+        option_closed = async_order.get("option-closed")
+        if not isinstance(option_closed, dict):
+            return None
+        message = option_closed.get("msg")
+        if not isinstance(message, dict):
+            return None
+        profit_amount = message.get("profit_amount")
+        amount = message.get("amount")
+        if profit_amount is None or amount is None:
+            return None
+        return float(profit_amount) - float(amount)
 
     def _poll_binary_result_from_socket(self, broker_id: int) -> float | None:
         api = getattr(self._client, "api", None)

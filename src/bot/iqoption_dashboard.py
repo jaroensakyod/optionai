@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from os import getenv
@@ -9,6 +10,7 @@ from typing import Any, Callable
 from .config import AppConfig
 from .iqoption_adapter import IQOptionAdapterError, IQOptionCredentials
 from .models import InstrumentType, MetricSnapshot, SessionLabel, TradeContextRecord, TradeJournalRecord
+from .signal_engine import format_strategy_display, format_strategy_group_displays, format_strategy_id_group_displays, format_strategy_id_set_display, normalize_strategy_ids
 from .stats_service import build_metric_snapshot
 from .trade_journal import TradeJournalRepository
 
@@ -193,12 +195,12 @@ class IQOptionDashboardService:
 
     def load_snapshot(self, *, selected_assets: tuple[str, ...] | None = None, history_limit: int = 20) -> DashboardSnapshot:
         self.reconnect_if_needed()
-        binary_pairs = self.list_open_binary_pairs()
+        binary_trades = self._list_account_binary_trades()
+        binary_pairs = self.list_open_binary_pairs(binary_trades=binary_trades)
         selected = _normalize_selected_assets(selected_assets, binary_pairs)
-        binary_trades = self._list_binary_trades(selected_assets=None)
-        selected_binary_trades = self._list_binary_trades(selected_assets=selected)
+        selected_binary_trades = self._filter_selected_trades(binary_trades, selected)
         closed_selected_binary_trades = [trade for trade in selected_binary_trades if trade.closed_at_utc is not None]
-        open_positions = self._list_open_positions()
+        open_positions = self._list_open_positions(binary_trades=binary_trades)
         recommended_pairs = tuple(pair for pair in binary_pairs if pair.is_recommended)[:3]
         return DashboardSnapshot(
             account_mode=self._selected_account_mode,
@@ -232,12 +234,12 @@ class IQOptionDashboardService:
         self._repository.clear_system_events(component="desktop_session")
         return deleted_trades
 
-    def list_open_binary_pairs(self) -> tuple[BinaryPairStatus, ...]:
+    def list_open_binary_pairs(self, *, binary_trades: list[TradeJournalRecord] | None = None) -> tuple[BinaryPairStatus, ...]:
         self.reconnect_if_needed()
         refreshed_at = datetime.now(UTC)
         profits = self._safe_get_all_profit()
         supported_assets = self._supported_binary_assets()
-        metrics_by_asset = self._build_metrics_by_asset()
+        metrics_by_asset = self._build_metrics_by_asset(binary_trades or self._list_account_binary_trades())
         statuses: list[BinaryPairStatus] = []
 
         for asset in sorted(profits):
@@ -278,7 +280,7 @@ class IQOptionDashboardService:
         )
 
     def build_local_selection_view(self, *, selected_assets: tuple[str, ...], history_limit: int = 20) -> LocalSelectionView:
-        selected_binary_trades = self._list_binary_trades(selected_assets=selected_assets)
+        selected_binary_trades = self._filter_selected_trades(self._list_account_binary_trades(), selected_assets)
         closed_selected_binary_trades = [trade for trade in selected_binary_trades if trade.closed_at_utc is not None]
         return LocalSelectionView(
             selected_assets=selected_assets,
@@ -286,30 +288,41 @@ class IQOptionDashboardService:
             recent_trades=tuple(self._build_trade_history_rows(closed_selected_binary_trades[-history_limit:])),
         )
 
-    def _list_binary_trades(self, *, selected_assets: tuple[str, ...] | None) -> list[TradeJournalRecord]:
-        trades = [
+    def _list_account_binary_trades(self) -> list[TradeJournalRecord]:
+        return [
             trade
             for trade in self._repository.list_trades(account_mode=self._selected_account_mode)
             if trade.instrument_type == InstrumentType.BINARY and _is_otc_asset(trade.asset)
         ]
-        if selected_assets:
-            selected_set = set(selected_assets)
-            trades = [trade for trade in trades if trade.asset in selected_set]
-        return trades
 
-    def _build_metrics_by_asset(self) -> dict[str, MetricSnapshot]:
-        assets = sorted({trade.asset for trade in self._list_binary_trades(selected_assets=None)})
+    def _list_binary_trades(self, *, selected_assets: tuple[str, ...] | None) -> list[TradeJournalRecord]:
+        return self._filter_selected_trades(self._list_account_binary_trades(), selected_assets)
+
+    def _filter_selected_trades(
+        self,
+        trades: list[TradeJournalRecord],
+        selected_assets: tuple[str, ...] | None,
+    ) -> list[TradeJournalRecord]:
+        if not selected_assets:
+            return list(trades)
+        selected_set = set(selected_assets)
+        return [trade for trade in trades if trade.asset in selected_set]
+
+    def _build_metrics_by_asset(self, trades: list[TradeJournalRecord]) -> dict[str, MetricSnapshot]:
+        trades_by_asset: dict[str, list[TradeJournalRecord]] = defaultdict(list)
+        for trade in trades:
+            trades_by_asset[trade.asset].append(trade)
         return {
-            asset: build_metric_snapshot(self._list_binary_trades(selected_assets=(asset,)))
-            for asset in assets
+            asset: build_metric_snapshot(asset_trades)
+            for asset, asset_trades in sorted(trades_by_asset.items())
         }
 
-    def _list_open_positions(self) -> tuple[OpenPositionRow, ...]:
+    def _list_open_positions(self, *, binary_trades: list[TradeJournalRecord] | None = None) -> tuple[OpenPositionRow, ...]:
         now_utc = datetime.now(UTC)
         open_trades = [
             trade
-            for trade in self._repository.list_trades(account_mode=self._selected_account_mode)
-            if trade.instrument_type == InstrumentType.BINARY and trade.closed_at_utc is None
+            for trade in (binary_trades or self._list_account_binary_trades())
+            if trade.closed_at_utc is None
         ]
         rows = [
             OpenPositionRow(
@@ -402,15 +415,20 @@ class IQOptionDashboardService:
 
     def _strategy_display_for_trade(self, trade: TradeJournalRecord) -> str:
         tags = self._repository.get_trade_tags(trade.trade_id)
+        strategy_ids = [strategy_id for strategy_id in tags.get("strategy_ids", "").split(",") if strategy_id]
+        if strategy_ids:
+            return format_strategy_id_set_display(strategy_ids)
+        profiles = [profile for profile in tags.get("strategy_profiles", "").split(",") if profile]
+        strategy_names = [name for name in tags.get("strategy_names", "").split(",") if name]
+        if profiles:
+            return format_strategy_display(profiles, strategy_names or None)
+        fallback_profile = tags.get("strategy_profile")
+        if fallback_profile:
+            fallback_name = tags.get("strategy_name")
+            return format_strategy_display((fallback_profile,), (fallback_name,) if fallback_name else None)
         display = tags.get("strategy_display")
         if display:
             return display
-        profiles = [profile for profile in tags.get("strategy_profiles", "").split(",") if profile]
-        if profiles:
-            return " + ".join(profiles)
-        fallback_profile = tags.get("strategy_profile")
-        if fallback_profile:
-            return fallback_profile
         return "UNKNOWN"
 
     def _build_strategy_analytics_rows(
@@ -451,12 +469,17 @@ class IQOptionDashboardService:
 
     def _strategy_groups_for_trade(self, trade: TradeJournalRecord) -> tuple[str, ...]:
         tags = self._repository.get_trade_tags(trade.trade_id)
+        strategy_ids = tuple(strategy_id for strategy_id in tags.get("strategy_ids", "").split(",") if strategy_id)
+        if strategy_ids:
+            return format_strategy_id_group_displays(normalize_strategy_ids(strategy_ids))
         profiles = tuple(profile for profile in tags.get("strategy_profiles", "").split(",") if profile)
+        strategy_names = tuple(name for name in tags.get("strategy_names", "").split(",") if name)
         if profiles:
-            return profiles
+            return format_strategy_group_displays(profiles, strategy_names or None)
         profile = tags.get("strategy_profile")
         if profile:
-            return (profile,)
+            strategy_name = tags.get("strategy_name")
+            return format_strategy_group_displays((profile,), (strategy_name,) if strategy_name else None)
         display = tags.get("strategy_display")
         if display:
             return (display,)

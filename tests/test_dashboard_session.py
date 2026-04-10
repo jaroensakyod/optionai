@@ -159,7 +159,7 @@ def test_dashboard_session_checks_each_selected_asset_on_start(tmp_path, monkeyp
 
     monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
     monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
-    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: FakeSignalEngine())
+    monkeypatch.setattr(dashboard_session, "build_selected_signal_engine", lambda _strategy_ids: FakeSignalEngine())
     monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
     monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
     monkeypatch.setattr(dashboard_session.time, "sleep", lambda _seconds: None)
@@ -168,7 +168,7 @@ def test_dashboard_session_checks_each_selected_asset_on_start(tmp_path, monkeyp
     run_config = SessionRunConfig(
         assets=("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"),
         batch_size=2,
-        strategy_profiles=("MEDIUM",),
+        strategy_ids=("trend-pullback.medium",),
         stake_amount=1.0,
         timeframe_sec=60,
         expiry_sec=60,
@@ -188,6 +188,214 @@ def test_dashboard_session_checks_each_selected_asset_on_start(tmp_path, monkeyp
     assert "AUDJPY-OTC" not in observed_update_assets
     assert "AUDCHF-OTC" in observed_update_assets
     assert updates[-1].status == "stopped"
+
+
+def test_dashboard_session_rotates_asset_batches_across_scan_windows(tmp_path, monkeypatch) -> None:
+    root_dir = _build_runtime_root(tmp_path)
+    observed_assets: list[str] = []
+    sleep_calls = 0
+
+    class FakeMarketDataProvider:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config):
+            return cls()
+
+    class FakeBrokerAdapter:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config, _repository, _journal_service):
+            return cls()
+
+        def get_balance(self) -> float:
+            return 100.0
+
+        def poll_trade_result(self, _trade_id: str):
+            return None
+
+    class FakeEventLogger:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def log(self, **_kwargs) -> None:
+            return None
+
+    class FakeBotRunner:
+        def __init__(self, **_kwargs):
+            return None
+
+        def run_once(self, plan):
+            observed_assets.append(plan.asset)
+            if len(observed_assets) >= 3:
+                controller.stop()
+            return BotRunResult(status="skipped", reason="no_signal")
+
+    def fake_sleep_until_next_scan_window(**_kwargs) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        return None
+
+    monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
+    monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
+    monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
+    monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
+    monkeypatch.setattr(dashboard_session, "build_selected_signal_engine", lambda _strategy_ids: object())
+    monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", fake_sleep_until_next_scan_window)
+
+    controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
+    run_config = SessionRunConfig(
+        assets=("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"),
+        batch_size=2,
+        strategy_ids=("trend-pullback.medium",),
+        stake_amount=1.0,
+        timeframe_sec=60,
+        expiry_sec=60,
+        poll_interval_sec=0.0,
+        stop_targets=SessionStopTargets(mode="$", profit_target=0.0, loss_limit=0.0),
+    )
+
+    controller._run_session("session-batch-rotation", run_config, lambda _snapshot: None)
+
+    assert observed_assets == ["AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"]
+    assert sleep_calls >= 2
+
+
+def test_dashboard_session_stops_current_round_after_entry_window_closes(tmp_path, monkeypatch) -> None:
+    root_dir = _build_runtime_root(tmp_path)
+    observed_assets: list[str] = []
+
+    class FakeMarketDataProvider:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config):
+            return cls()
+
+    class FakeBrokerAdapter:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config, _repository, _journal_service):
+            return cls()
+
+        def get_balance(self) -> float:
+            return 100.0
+
+        def poll_trade_result(self, _trade_id: str):
+            return None
+
+    class FakeEventLogger:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def log(self, **_kwargs) -> None:
+            return None
+
+    class FakeBotRunner:
+        def __init__(self, **_kwargs):
+            return None
+
+        def run_once(self, plan):
+            observed_assets.append(plan.asset)
+            controller.stop()
+            return BotRunResult(status="skipped", reason="awaiting_entry_window")
+
+    monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
+    monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
+    monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
+    monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
+    monkeypatch.setattr(dashboard_session, "build_selected_signal_engine", lambda _strategy_ids: object())
+    monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
+
+    controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
+    run_config = SessionRunConfig(
+        assets=("AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC"),
+        batch_size=2,
+        strategy_ids=("trend-pullback.medium",),
+        stake_amount=1.0,
+        timeframe_sec=60,
+        expiry_sec=60,
+        poll_interval_sec=0.0,
+        stop_targets=SessionStopTargets(mode="$", profit_target=0.0, loss_limit=0.0),
+    )
+
+    controller._run_session("session-entry-window-cutoff", run_config, lambda _snapshot: None)
+
+    assert observed_assets == ["AUDCAD-OTC"]
+
+
+def test_dashboard_session_reports_exception_details(tmp_path, monkeypatch) -> None:
+    root_dir = _build_runtime_root(tmp_path)
+    logged_events: list[dict[str, object]] = []
+
+    class FakeMarketDataProvider:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config):
+            return cls()
+
+    class FakeBrokerAdapter:
+        def connect(self) -> None:
+            return None
+
+        @classmethod
+        def from_environment(cls, _config, _repository, _journal_service):
+            return cls()
+
+        def get_balance(self) -> float:
+            return 100.0
+
+        def poll_trade_result(self, _trade_id: str):
+            return None
+
+    class FakeEventLogger:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def log(self, **kwargs) -> None:
+            logged_events.append(kwargs)
+
+    class FakeBotRunner:
+        def __init__(self, **_kwargs):
+            return None
+
+        def run_once(self, _plan):
+            raise AttributeError("missing direction")
+
+    monkeypatch.setattr(dashboard_session, "IQOptionMarketDataProvider", FakeMarketDataProvider)
+    monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
+    monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
+    monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
+    monkeypatch.setattr(dashboard_session, "build_selected_signal_engine", lambda _strategy_ids: object())
+    monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
+
+    controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
+    run_config = SessionRunConfig(
+        assets=("AUDCAD-OTC",),
+        batch_size=1,
+        strategy_ids=("momentum.high", "trend-pullback.high", "mean-reversion.high"),
+        stake_amount=1.0,
+        timeframe_sec=60,
+        expiry_sec=60,
+        poll_interval_sec=0.0,
+        stop_targets=SessionStopTargets(mode="$", profit_target=0.0, loss_limit=0.0),
+    )
+    updates: list[object] = []
+
+    controller._run_session("session-error-details", run_config, updates.append)
+
+    assert updates[-1].status == "error"
+    assert updates[-1].last_reason == "AttributeError: missing direction"
+    assert logged_events[-1]["event_type"] == "session_error"
+    assert logged_events[-1]["details"] == {"error_type": "AttributeError", "error_message": "missing direction"}
 
 
 def test_dashboard_session_keeps_checking_other_assets_while_trade_is_open(tmp_path, monkeypatch) -> None:
@@ -260,14 +468,14 @@ def test_dashboard_session_keeps_checking_other_assets_while_trade_is_open(tmp_p
     monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
     monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
     monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
-    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: object())
+    monkeypatch.setattr(dashboard_session, "build_selected_signal_engine", lambda _strategy_ids: object())
     monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
 
     controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
     run_config = SessionRunConfig(
         assets=("AUDCAD-OTC", "AUDCHF-OTC"),
         batch_size=2,
-        strategy_profiles=("MEDIUM",),
+        strategy_ids=("trend-pullback.medium",),
         stake_amount=1.0,
         timeframe_sec=60,
         expiry_sec=60,
@@ -368,14 +576,14 @@ def test_dashboard_session_records_closed_trade_result_on_next_poll_cycle(tmp_pa
     monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
     monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
     monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
-    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: object())
+    monkeypatch.setattr(dashboard_session, "build_selected_signal_engine", lambda _strategy_ids: object())
     monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
 
     controller = DashboardSessionController(_load_test_config(tmp_path), root_dir)
     run_config = SessionRunConfig(
         assets=("AUDCAD-OTC",),
         batch_size=1,
-        strategy_profiles=("MEDIUM",),
+        strategy_ids=("trend-pullback.medium",),
         stake_amount=1.0,
         timeframe_sec=60,
         expiry_sec=60,
@@ -784,7 +992,7 @@ def test_dashboard_session_survives_poll_errors_and_closes_expired_trade(tmp_pat
     monkeypatch.setattr(dashboard_session, "IQOptionAdapter", FakeBrokerAdapter)
     monkeypatch.setattr(dashboard_session, "BotRunner", FakeBotRunner)
     monkeypatch.setattr(dashboard_session, "RuntimeEventLogger", FakeEventLogger)
-    monkeypatch.setattr(dashboard_session, "build_composite_signal_engine", lambda _profiles: object())
+    monkeypatch.setattr(dashboard_session, "build_selected_signal_engine", lambda _strategy_ids: object())
     monkeypatch.setattr(dashboard_session, "datetime", FrozenDateTime)
     monkeypatch.setattr(dashboard_session.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(dashboard_session, "_sleep_until_next_scan_window", lambda **_kwargs: None)
@@ -793,7 +1001,7 @@ def test_dashboard_session_survives_poll_errors_and_closes_expired_trade(tmp_pat
     run_config = SessionRunConfig(
         assets=("AUDCAD-OTC",),
         batch_size=1,
-        strategy_profiles=("MEDIUM",),
+        strategy_ids=("trend-pullback.medium",),
         stake_amount=1.0,
         timeframe_sec=60,
         expiry_sec=60,

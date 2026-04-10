@@ -159,8 +159,8 @@ def test_dashboard_service_builds_strategy_analytics_from_trade_tags(tmp_path, m
     config = load_config(tmp_path)
     repository = _build_repository(tmp_path)
     _seed_binary_trades(repository)
-    repository.replace_trade_tags("binary-win", {"strategy_profiles": "LOW,MEDIUM", "strategy_display": "LOW + MEDIUM"})
-    repository.replace_trade_tags("binary-loss", {"strategy_profiles": "HIGH", "strategy_display": "HIGH"})
+    repository.replace_trade_tags("binary-win", {"strategy_profiles": "LOW,MEDIUM", "strategy_names": "strict-ema-pullback,balanced-ema-pullback", "strategy_display": "LOW / strict-ema-pullback + MEDIUM / balanced-ema-pullback"})
+    repository.replace_trade_tags("binary-loss", {"strategy_profiles": "HIGH", "strategy_names": "aggressive-ema-pullback", "strategy_display": "HIGH / aggressive-ema-pullback"})
     client = FakeIQDashboardClient("user@example.com", "secret")
     service = IQOptionDashboardService(
         config=config,
@@ -172,10 +172,38 @@ def test_dashboard_service_builds_strategy_analytics_from_trade_tags(tmp_path, m
     service.connect()
     analytics = service.build_strategy_analytics_snapshot()
 
-    assert any(row.strategy_display == "LOW" and row.group_value == "AUDCAD-OTC" and row.trades == 1 for row in analytics.by_asset)
-    assert any(row.strategy_display == "MEDIUM" and row.group_value == "AUDCAD-OTC" and row.trades == 1 for row in analytics.by_asset)
-    assert any(row.strategy_display == "HIGH" and row.group_value == "UNKNOWN" and row.trades == 1 for row in analytics.by_session)
+    assert any(row.strategy_display == "LOW / strict-ema-pullback" and row.group_value == "AUDCAD-OTC" and row.trades == 1 for row in analytics.by_asset)
+    assert any(row.strategy_display == "MEDIUM / balanced-ema-pullback" and row.group_value == "AUDCAD-OTC" and row.trades == 1 for row in analytics.by_asset)
+    assert any(row.strategy_display == "HIGH / aggressive-ema-pullback" and row.group_value == "UNKNOWN" and row.trades == 1 for row in analytics.by_session)
     assert all(not row.strategy_display.startswith("desktop-") for row in analytics.by_asset)
+    repository.close()
+
+
+def test_dashboard_service_formats_history_display_from_profile_and_engine_tags(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    config = load_config(tmp_path)
+    repository = _build_repository(tmp_path)
+    _seed_binary_trades(repository)
+    repository.replace_trade_tags(
+        "binary-win",
+        {
+            "strategy_profile": "LOW",
+            "strategy_profiles": "LOW",
+            "strategy_name": "strict-ema-pullback",
+            "strategy_names": "strict-ema-pullback",
+        },
+    )
+    client = FakeIQDashboardClient("user@example.com", "secret")
+    service = IQOptionDashboardService(
+        config=config,
+        repository=repository,
+        credentials=IQOptionCredentials(email="user@example.com", password="secret"),
+        client_factory=lambda email, password: client,
+    )
+
+    snapshot = service.load_snapshot(selected_assets=("AUDCAD-OTC",))
+
+    assert any(trade.strategy_display == "LOW / strict-ema-pullback" for trade in snapshot.recent_trades)
     repository.close()
 
 
@@ -230,6 +258,40 @@ def test_dashboard_service_filters_assets_missing_from_actives_opcode_map(tmp_pa
     assert [pair.asset for pair in pairs] == ["AUDCAD-OTC", "USDJPY-OTC", "AUDCHF-OTC"]
     unsupported_pair = next(pair for pair in pairs if pair.asset == "AUDCHF-OTC")
     assert unsupported_pair.is_supported is False
+    repository.close()
+
+
+def test_dashboard_service_load_snapshot_uses_single_trade_scan(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    config = load_config(tmp_path)
+    repository = _build_repository(tmp_path)
+    _seed_binary_trades(repository)
+
+    class CountingRepository:
+        def __init__(self, inner_repository):
+            self._inner_repository = inner_repository
+            self.list_trades_calls = 0
+
+        def list_trades(self, *args, **kwargs):
+            self.list_trades_calls += 1
+            return self._inner_repository.list_trades(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner_repository, name)
+
+    counting_repository = CountingRepository(repository)
+    client = FakeIQDashboardClient("user@example.com", "secret")
+    service = IQOptionDashboardService(
+        config=config,
+        repository=counting_repository,
+        credentials=IQOptionCredentials(email="user@example.com", password="secret"),
+        client_factory=lambda email, password: client,
+    )
+
+    snapshot = service.load_snapshot(selected_assets=("AUDCAD-OTC",))
+
+    assert snapshot.summary_metrics.total_trades == 2
+    assert counting_repository.list_trades_calls == 1
     repository.close()
 
 

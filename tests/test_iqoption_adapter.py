@@ -82,6 +82,16 @@ class FakeIQOptionBlockingRecentClosedClient(FakeIQOptionClient):
         raise AssertionError("blocking get_optioninfo_v2 must not be called during polling")
 
 
+class FakeIQOptionAsyncBinaryClient(FakeIQOptionClient):
+    def __init__(self, email: str, password: str):
+        super().__init__(email, password)
+        self.api = type("FakeApi", (), {"socket_option_closed": {}, "get_options_v2_data": None})()
+        self.async_orders: dict[int, dict[str, dict[str, dict[str, float]]]] = {}
+
+    def get_async_order(self, broker_id: int):
+        return self.async_orders.get(broker_id, {"option-closed": {}})
+
+
 def test_iqoption_adapter_submit_and_poll(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
     config = load_config(tmp_path)
@@ -363,4 +373,63 @@ def test_iqoption_adapter_does_not_call_blocking_recent_closed_lookup(tmp_path, 
 
     assert polled_trade is None
     assert fake_client.get_optioninfo_v2_called is False
+    repository.close()
+
+
+def test_iqoption_adapter_polls_binary_result_from_async_order_when_api_exists(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    config = load_config(tmp_path)
+    database_path = tmp_path / "trades.db"
+    schema_path = Path(__file__).resolve().parents[1] / "sql" / "001_initial_schema.sql"
+    repository = TradeJournalRepository.from_paths(database_path, schema_path)
+    journal_service = JournalService(repository)
+    fake_client = FakeIQOptionAsyncBinaryClient("user@example.com", "secret")
+    adapter = IQOptionAdapter(
+        config=config,
+        repository=repository,
+        journal_service=journal_service,
+        credentials=IQOptionCredentials(email="user@example.com", password="secret"),
+        client_factory=lambda email, password: fake_client,
+    )
+    strategy = StrategyVersion(
+        strategy_version_id="v6",
+        created_at_utc=datetime(2026, 4, 9, 12, 0, 0, tzinfo=UTC),
+        strategy_name="demo-strategy",
+        parameter_hash="pqr678",
+        parameters={"cooldown": 60},
+        created_by="user",
+        approval_status="approved",
+    )
+    repository.save_strategy_version(strategy)
+    signal_event = SignalEvent(
+        signal_id="s-binary-async-order",
+        created_at_utc=datetime(2026, 4, 9, 12, 0, 0, tzinfo=UTC),
+        strategy_version_id="v6",
+        asset="GBPUSD",
+        instrument_type=InstrumentType.BINARY,
+        timeframe_sec=60,
+        direction=TradeDirection.CALL,
+        intended_amount=1.0,
+        intended_expiry_sec=60,
+        entry_reason="async-order-close",
+        session_label=SessionLabel.LONDON,
+    )
+
+    adapter.connect()
+
+    open_trade = adapter.submit_order(signal_event=signal_event, strategy_version_id="v6")
+    fake_client.async_orders[202] = {
+        "option-closed": {
+            "msg": {
+                "profit_amount": 1.82,
+                "amount": 1.0,
+            }
+        }
+    }
+
+    closed_trade = adapter.poll_trade_result(open_trade.trade_id)
+
+    assert closed_trade is not None
+    assert closed_trade.result == TradeResult.WIN
+    assert closed_trade.profit_loss_abs == pytest.approx(0.82)
     repository.close()

@@ -171,6 +171,84 @@ def test_bot_runner_skips_binary_trade_outside_entry_window(tmp_path, monkeypatc
     repository.close()
 
 
+def test_bot_runner_logs_detailed_momentum_no_signal_reason(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ACCOUNT_MODE", "PRACTICE")
+    config = load_config(tmp_path)
+    repository = _build_repository(tmp_path)
+    journal_service = JournalService(repository)
+
+    class ChoppyMarketDataProvider:
+        def get_recent_candles(self, *, asset: str, instrument_type: InstrumentType, timeframe_sec: int, limit: int):
+            candles = []
+            current = 1.2000
+            for index in range(limit):
+                if index % 2 == 0:
+                    next_close = current + 0.00012
+                    candles.append(
+                        type("CandleRow", (), {
+                            "opened_at_utc": datetime(2026, 4, 9, 8, 3, tzinfo=UTC),
+                            "asset": asset,
+                            "instrument_type": instrument_type,
+                            "timeframe_sec": timeframe_sec,
+                            "open_price": current,
+                            "high_price": current + 0.00022,
+                            "low_price": current - 0.00018,
+                            "close_price": next_close,
+                        })
+                    )
+                else:
+                    next_close = current - 0.00010
+                    candles.append(
+                        type("CandleRow", (), {
+                            "opened_at_utc": datetime(2026, 4, 9, 8, 3, tzinfo=UTC),
+                            "asset": asset,
+                            "instrument_type": instrument_type,
+                            "timeframe_sec": timeframe_sec,
+                            "open_price": current,
+                            "high_price": current + 0.00018,
+                            "low_price": current - 0.00022,
+                            "close_price": next_close,
+                        })
+                    )
+                current = next_close
+            return candles
+
+    class FakeEventLogger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def log(self, **kwargs) -> None:
+            self.events.append(kwargs)
+
+    event_logger = FakeEventLogger()
+    runner = BotRunner(
+        config=config,
+        repository=repository,
+        journal_service=journal_service,
+        market_data_provider=ChoppyMarketDataProvider(),
+        signal_engine=SimpleMomentumSignalEngine(),
+        broker_adapter=PracticeBrokerAdapter(config, repository, journal_service),
+        event_logger=event_logger,
+    )
+
+    result = runner.run_once(
+        RunnerPlan(
+            strategy_version_id="runner-no-signal-v1",
+            asset="GBPUSD",
+            instrument_type=InstrumentType.DIGITAL,
+            timeframe_sec=60,
+            stake_amount=1.0,
+            expiry_sec=60,
+        ),
+        now_utc=datetime(2026, 4, 9, 8, 3, tzinfo=UTC),
+    )
+
+    assert result == BotRunResult(status="skipped", reason="pattern_not_aligned")
+    assert event_logger.events[-1]["event_type"] == "no_signal"
+    assert event_logger.events[-1]["details"] == {"asset": "GBPUSD", "reason": "pattern_not_aligned"}
+    repository.close()
+
+
 
 
 def test_bot_runner_skips_when_broker_reports_closed_pair(tmp_path, monkeypatch) -> None:

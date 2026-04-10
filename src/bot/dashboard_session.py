@@ -18,7 +18,7 @@ from .journal_service import JournalService
 from .models import InstrumentType, TradeResult
 from .runtime_logging import RuntimeEventLogger
 from .safety import StaleMarketDataGuard
-from .signal_engine import build_composite_signal_engine, normalize_strategy_profiles
+from .signal_engine import build_selected_signal_engine, normalize_strategy_ids
 from .trade_journal import TradeJournalRepository
 
 
@@ -38,7 +38,7 @@ class SessionStopTargets:
 class SessionRunConfig:
     assets: tuple[str, ...]
     batch_size: int
-    strategy_profiles: tuple[str, ...]
+    strategy_ids: tuple[str, ...]
     stake_amount: float
     timeframe_sec: int
     expiry_sec: int
@@ -163,7 +163,7 @@ class DashboardSessionController:
             repository=repository,
             journal_service=journal_service,
             market_data_provider=market_data_provider,
-            signal_engine=build_composite_signal_engine(run_config.strategy_profiles),
+            signal_engine=build_selected_signal_engine(run_config.strategy_ids),
             broker_adapter=broker_adapter,
             stale_data_guard=StaleMarketDataGuard(max_data_age_sec=max(run_config.timeframe_sec * 3, 180)),
             duplicate_signal_guard=duplicate_signal_guard,
@@ -179,6 +179,8 @@ class DashboardSessionController:
                 batch_size=run_config.batch_size,
                 poll_interval_sec=run_config.poll_interval_sec,
             )
+            asset_batches = _chunk_assets(run_config.assets, effective_batch_size)
+            next_batch_index = 0
             reconcile_open_practice_trades(
                 repository=repository,
                 journal_service=journal_service,
@@ -211,39 +213,47 @@ class DashboardSessionController:
                         on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(resolved_trade.asset,), current_asset=resolved_trade.asset, last_run_status=resolved_trade.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=resolved_trade.trade_id, target_mode=run_config.stop_targets.mode))
                         return
 
-                for asset_batch in _chunk_assets(run_config.assets, effective_batch_size):
+                if not asset_batches:
+                    continue
+
+                asset_batch = asset_batches[next_batch_index % len(asset_batches)]
+                next_batch_index += 1
+
+                batch_label = " + ".join(asset_batch)
+                on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=asset_batch, current_asset=batch_label, last_run_status="checking", baseline_balance=baseline_balance, status="running", last_reason="checking_asset_batch", last_trade_id=None, target_mode=run_config.stop_targets.mode))
+
+                batch_results: list[tuple[str, object]] = []
+                entry_window_closed = False
+                for asset in asset_batch:
                     if self._stop_event.is_set():
                         break
-
-                    batch_label = " + ".join(asset_batch)
-                    on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=asset_batch, current_asset=batch_label, last_run_status="checking", baseline_balance=baseline_balance, status="running", last_reason="checking_asset_batch", last_trade_id=None, target_mode=run_config.stop_targets.mode))
-
-                    batch_results: list[tuple[str, object]] = []
-                    for asset in asset_batch:
-                        if self._stop_event.is_set():
-                            break
-                        result = runner.run_once(
-                            RunnerPlan(
-                                strategy_version_id=session_id,
-                                asset=asset,
-                                instrument_type=InstrumentType.BINARY,
-                                timeframe_sec=run_config.timeframe_sec,
-                                stake_amount=run_config.stake_amount,
-                                expiry_sec=run_config.expiry_sec,
-                                tags={"desktop_session": session_id},
-                            )
+                    result = runner.run_once(
+                        RunnerPlan(
+                            strategy_version_id=session_id,
+                            asset=asset,
+                            instrument_type=InstrumentType.BINARY,
+                            timeframe_sec=run_config.timeframe_sec,
+                            stake_amount=run_config.stake_amount,
+                            expiry_sec=run_config.expiry_sec,
+                            tags={"desktop_session": session_id},
                         )
-                        batch_results.append((asset, result))
-                        if result.trade_id is not None:
-                            pending_trades[result.trade_id] = asset
-                        on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, last_run_status=result.status, baseline_balance=baseline_balance, status="running", last_reason=result.reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
+                    )
+                    batch_results.append((asset, result))
+                    if result.trade_id is not None:
+                        pending_trades[result.trade_id] = asset
+                    on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(asset,), current_asset=asset, last_run_status=result.status, baseline_balance=baseline_balance, status="running", last_reason=result.reason, last_trade_id=result.trade_id, target_mode=run_config.stop_targets.mode))
+                    if result.reason == "awaiting_entry_window":
+                        entry_window_closed = True
+                        break
 
-                    if batch_results:
-                        last_asset, last_result = batch_results[-1]
-                        threshold_reason = check_stop_threshold(repository=repository, strategy_version_id=session_id, baseline_balance=baseline_balance, targets=run_config.stop_targets)
-                        if threshold_reason is not None:
-                            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(last_asset,), current_asset=last_asset, last_run_status=last_result.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=last_result.trade_id, target_mode=run_config.stop_targets.mode))
-                            return
+                if batch_results:
+                    last_asset, last_result = batch_results[-1]
+                    threshold_reason = check_stop_threshold(repository=repository, strategy_version_id=session_id, baseline_balance=baseline_balance, targets=run_config.stop_targets)
+                    if threshold_reason is not None:
+                        on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(last_asset,), current_asset=last_asset, last_run_status=last_result.status, baseline_balance=baseline_balance, status="stopped", last_reason=threshold_reason, last_trade_id=last_result.trade_id, target_mode=run_config.stop_targets.mode))
+                        return
+                if entry_window_closed:
+                    continue
 
             resolved_trades = _poll_pending_session_trades(
                 repository=repository,
@@ -256,7 +266,14 @@ class DashboardSessionController:
                 on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(resolved_trade.asset,), current_asset=resolved_trade.asset, last_run_status=resolved_trade.status, baseline_balance=baseline_balance, status="running", last_reason=resolved_trade.reason, last_trade_id=resolved_trade.trade_id, target_mode=run_config.stop_targets.mode))
             on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="stopped", baseline_balance=baseline_balance, status="stopped", last_reason="manual_stop", last_trade_id=None, target_mode=run_config.stop_targets.mode))
         except Exception as exc:
-            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="error", baseline_balance=baseline_balance, status="error", last_reason=type(exc).__name__, last_trade_id=None, target_mode=run_config.stop_targets.mode))
+            error_reason = type(exc).__name__ if not str(exc) else f"{type(exc).__name__}: {exc}"
+            event_logger.log(
+                severity="error",
+                event_type="session_error",
+                message="Desktop session loop raised an exception.",
+                details={"error_type": type(exc).__name__, "error_message": str(exc)},
+            )
+            on_update(build_session_snapshot(repository=repository, strategy_version_id=session_id, selected_assets=run_config.assets, current_assets=(), current_asset=None, last_run_status="error", baseline_balance=baseline_balance, status="error", last_reason=error_reason, last_trade_id=None, target_mode=run_config.stop_targets.mode))
         finally:
             repository.close()
 

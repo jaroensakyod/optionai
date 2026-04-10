@@ -19,7 +19,27 @@ from .practice_harness import PracticeIntegrationHarness
 from .runtime_logging import RuntimeEventLogger
 from .safety import FileKillSwitch, ReconnectBackoffPolicy, StaleMarketDataGuard
 from .scheduler import BotScheduler, SchedulerConfig
-from .signal_engine import build_signal_engine
+from .signal_engine import STRATEGY_ID_ORDER, build_selected_signal_engine, normalize_strategy_id
+
+
+_SIGNAL_ENGINE_CHOICES = (
+    *STRATEGY_ID_ORDER,
+    "LOW",
+    "MEDIUM",
+    "HIGH",
+    "trend-pullback",
+    "strict-ema-pullback",
+    "balanced-ema-pullback",
+    "aggressive-ema-pullback",
+    "simple-momentum",
+    "blitz",
+    "blitz-momentum",
+    "relaxed-momentum",
+    "mean-reversion",
+    "bollinger-rsi-reversion",
+)
+
+DEFAULT_SIGNAL_ENGINE = "momentum.medium"
 from .trade_journal import TradeJournalRepository
 
 
@@ -32,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy-version-id", required=True)
     parser.add_argument("--asset", action="append", dest="assets", help="Asset to trade. Repeat for multi-asset campaigns.")
     parser.add_argument("--instrument-type", choices=("binary", "digital"), required=True)
-    parser.add_argument("--signal-engine", choices=("simple-momentum", "blitz"), default="simple-momentum")
+    parser.add_argument("--signal-engine", choices=_SIGNAL_ENGINE_CHOICES, default=DEFAULT_SIGNAL_ENGINE)
     parser.add_argument("--timeframe-sec", type=int, default=60)
     parser.add_argument("--stake", type=float, default=1.0)
     parser.add_argument("--expiry-sec", type=int, default=60)
@@ -199,8 +219,6 @@ def _validate_args(args, assets: list[str], parser: argparse.ArgumentParser) -> 
         parser.error("--market-data-csv is required when --market-data-source=csv")
     if args.broker == "iqoption" and args.expiry_sec % 60 != 0:
         parser.error("--expiry-sec must be a whole minute when --broker=iqoption with the current adapter")
-    if args.signal_engine == "blitz" and args.timeframe_sec != 30:
-        parser.error("--signal-engine=blitz expects --timeframe-sec=30")
     if args.target_closed_trades < 0:
         parser.error("--target-closed-trades cannot be negative")
     if args.checkpoint_trades < 0:
@@ -218,9 +236,7 @@ def _validate_args(args, assets: list[str], parser: argparse.ArgumentParser) -> 
 
 
 def _build_signal_engine(engine_name: str):
-    if engine_name == "blitz":
-        return build_signal_engine("MEDIUM")
-    return build_signal_engine("LOW")
+    return build_selected_signal_engine((normalize_strategy_id(engine_name),))
 
 
 def _build_market_data_provider(args, config):

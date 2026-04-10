@@ -12,7 +12,7 @@ from .market_data import MarketDataProvider
 from .models import InstrumentType, StrategyVersion, TradeJournalRecord
 from .runtime_logging import RuntimeEventLogger
 from .safety import KillSwitch, StaleMarketDataGuard
-from .signal_engine import SignalEngine
+from .signal_engine import SignalEngine, format_strategy_id_set_display, normalize_strategy_ids, strategy_family_id, strategy_profile_to_id, strategy_profiles_from_ids
 from .trade_journal import TradeJournalRepository
 
 
@@ -121,8 +121,16 @@ class BotRunner:
             signal_time_utc=current_time,
         )
         if signal_event is None:
-            self._log_event("info", "no_signal", "Runner found no signal.", {"asset": plan.asset})
-            return BotRunResult(status="skipped", reason="no_signal")
+            no_signal_reason = self._diagnose_no_signal(
+                plan=plan,
+                candles=candles,
+                current_time=current_time,
+            )
+            event_details = {"asset": plan.asset}
+            if no_signal_reason is not None:
+                event_details["reason"] = no_signal_reason
+            self._log_event("info", "no_signal", "Runner found no signal.", event_details)
+            return BotRunResult(status="skipped", reason=no_signal_reason or "no_signal")
         if signal_event.is_filtered_out:
             filter_reason = signal_event.filter_reason or "signal_filtered"
             self._log_event(
@@ -197,6 +205,21 @@ class BotRunner:
         if self._event_logger is not None:
             self._event_logger.log(severity=severity, event_type=event_type, message=message, details=details)
 
+    def _diagnose_no_signal(self, *, plan: RunnerPlan, candles: list[Any], current_time: datetime) -> str | None:
+        diagnose_no_signal = getattr(self._signal_engine, "diagnose_no_signal", None)
+        if not callable(diagnose_no_signal):
+            return None
+        return diagnose_no_signal(
+            strategy_version_id=plan.strategy_version_id,
+            asset=plan.asset,
+            instrument_type=plan.instrument_type,
+            timeframe_sec=plan.timeframe_sec,
+            stake_amount=plan.stake_amount,
+            expiry_sec=plan.expiry_sec,
+            candles=candles,
+            signal_time_utc=current_time,
+        )
+
     def _ensure_strategy_version(self, plan: RunnerPlan, now_utc: datetime) -> None:
         parameters = {
             **self._signal_engine.describe_parameters(),
@@ -221,13 +244,36 @@ class BotRunner:
 
     def _strategy_trade_tags(self, signal_event) -> dict[str, str]:
         indicator_snapshot = getattr(signal_event, "indicator_snapshot", {}) or {}
+        contributing_ids = [str(strategy_id) for strategy_id in indicator_snapshot.get("strategy_ids", ()) if str(strategy_id)]
         contributing_profiles = [str(profile) for profile in indicator_snapshot.get("strategy_profiles", ()) if str(profile)]
         contributing_names = [str(name) for name in indicator_snapshot.get("strategy_names", ()) if str(name)]
-        if contributing_profiles:
+        contributing_families = [str(family) for family in indicator_snapshot.get("strategy_families", ()) if str(family)]
+        if contributing_ids:
+            normalized_ids = normalize_strategy_ids(contributing_ids)
+            normalized_profiles = tuple(contributing_profiles) if contributing_profiles else strategy_profiles_from_ids(normalized_ids)
             tags = {
+                "strategy_id": normalized_ids[0],
+                "strategy_ids": ",".join(normalized_ids),
+                "strategy_family": contributing_families[0] if contributing_families else strategy_family_id(normalized_ids[0]),
+                "strategy_families": ",".join(contributing_families) if contributing_families else ",".join(strategy_family_id(strategy_id) for strategy_id in normalized_ids),
+                "strategy_profile": normalized_profiles[0],
+                "strategy_profiles": ",".join(normalized_profiles),
+                "strategy_display": format_strategy_id_set_display(normalized_ids),
+            }
+            if contributing_names:
+                tags["strategy_name"] = contributing_names[0]
+                tags["strategy_names"] = ",".join(contributing_names)
+            return tags
+        if contributing_profiles:
+            normalized_ids = tuple(strategy_profile_to_id(profile) for profile in contributing_profiles)
+            tags = {
+                "strategy_id": normalized_ids[0],
+                "strategy_ids": ",".join(normalized_ids),
+                "strategy_family": strategy_family_id(normalized_ids[0]),
+                "strategy_families": ",".join(strategy_family_id(strategy_id) for strategy_id in normalized_ids),
                 "strategy_profile": contributing_profiles[0],
                 "strategy_profiles": ",".join(contributing_profiles),
-                "strategy_display": " + ".join(contributing_profiles),
+                "strategy_display": format_strategy_id_set_display(normalized_ids),
             }
             if contributing_names:
                 tags["strategy_name"] = contributing_names[0]
@@ -240,11 +286,19 @@ class BotRunner:
 
         strategy_profile = getattr(self._signal_engine, "strategy_profile", None)
         strategy_name = getattr(self._signal_engine, "strategy_name", None)
+        strategy_id = getattr(self._signal_engine, "strategy_id", None)
+        strategy_family = getattr(self._signal_engine, "strategy_family", None)
         tags: dict[str, str] = {}
+        if isinstance(strategy_id, str) and strategy_id:
+            normalized_id = normalize_strategy_ids((strategy_id,))[0]
+            tags["strategy_id"] = normalized_id
+            tags["strategy_ids"] = normalized_id
+            tags["strategy_family"] = strategy_family if isinstance(strategy_family, str) and strategy_family else strategy_family_id(normalized_id)
+            tags["strategy_families"] = tags["strategy_family"]
         if isinstance(strategy_profile, str) and strategy_profile:
             tags["strategy_profile"] = strategy_profile
             tags["strategy_profiles"] = strategy_profile
-            tags["strategy_display"] = strategy_profile
+            tags["strategy_display"] = format_strategy_id_set_display((tags.get("strategy_id") or strategy_profile_to_id(strategy_profile),))
         if isinstance(strategy_name, str) and strategy_name:
             tags["strategy_name"] = strategy_name
             tags["strategy_names"] = strategy_name

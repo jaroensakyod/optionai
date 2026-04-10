@@ -12,7 +12,7 @@ from .config import load_config
 from .dashboard_session import DashboardSessionController, SessionRunConfig, SessionStateSnapshot, SessionStopTargets
 from .env import load_dotenv_file
 from .iqoption_dashboard import DashboardSnapshot, IQOptionDashboardService, OpenPositionRow
-from .signal_engine import format_strategy_profiles, normalize_strategy_profiles
+from .signal_engine import DEFAULT_STRATEGY_ID, STRATEGY_ID_ORDER, format_strategy_ids, format_strategy_option_label, normalize_strategy_ids, strategy_family_label, strategy_profiles_from_ids
 from .trade_journal import TradeJournalRepository
 
 
@@ -63,6 +63,10 @@ class DashboardWindow:
         self._pair_status_labels: dict[str, tk.Label] = {}
         self._pair_chance_labels: dict[str, tk.Label] = {}
         self._pair_render_cache: dict[str, tuple[object, ...]] = {}
+        self._history_render_cache: dict[str, tuple[object, ...]] = {}
+        self._open_positions_render_cache: dict[str, tuple[object, ...]] = {}
+        self._analytics_asset_render_cache: dict[str, tuple[object, ...]] = {}
+        self._analytics_session_render_cache: dict[str, tuple[object, ...]] = {}
 
         preferences = load_dashboard_preferences(self._prefs_path)
         saved_username = preferences.get("last_username", "")
@@ -86,10 +90,10 @@ class DashboardWindow:
         self._poll_var = tk.StringVar(value=preferences.get("poll_sec", "5"))
         self._target_mode_var = tk.StringVar(value=preferences.get("target_mode", "$"))
         self._batch_size_var = tk.StringVar(value=preferences.get("batch_size", "2"))
-        strategy_profiles = _load_strategy_profiles(preferences)
+        strategy_ids = _load_strategy_ids(preferences)
         self._strategy_vars = {
-            profile: tk.BooleanVar(value=profile in strategy_profiles)
-            for profile in ("LOW", "MEDIUM", "HIGH")
+            strategy_id: tk.BooleanVar(value=strategy_id in strategy_ids)
+            for strategy_id in STRATEGY_ID_ORDER
         }
         self._login_mode_var = tk.StringVar(value=preferences.get("login_account_mode", "PRACTICE"))
         self._profit_target_var = tk.StringVar(value=preferences.get("profit_target", "5"))
@@ -258,16 +262,27 @@ class DashboardWindow:
         row.pack(fill=tk.X, pady=(10, 0))
         tk.Label(row, text="Strategies", bg="#f8f5ee", fg="#38423c", font=("Segoe UI", 10)).pack(anchor="w")
         selector_row = tk.Frame(row, bg="#f8f5ee")
-        selector_row.pack(anchor="w", pady=(4, 0))
-        for profile in ("LOW", "MEDIUM", "HIGH"):
+        selector_row.pack(fill=tk.X, anchor="w", pady=(4, 0))
+        current_family_label = ""
+        for strategy_id in STRATEGY_ID_ORDER:
+            family_label = strategy_family_label(strategy_id)
+            if family_label != current_family_label:
+                current_family_label = family_label
+                tk.Label(
+                    selector_row,
+                    text=family_label,
+                    bg="#f8f5ee",
+                    fg="#6b705c",
+                    font=("Segoe UI Semibold", 9),
+                ).pack(anchor="w", pady=(4 if selector_row.winfo_children() else 0, 0))
             tk.Checkbutton(
                 selector_row,
-                text=profile,
-                variable=self._strategy_vars[profile],
+                text=format_strategy_option_label(strategy_id),
+                variable=self._strategy_vars[strategy_id],
                 bg="#f8f5ee",
                 activebackground="#f8f5ee",
                 command=self._handle_strategy_selection_change,
-            ).pack(side=tk.LEFT, padx=(0, 8))
+            ).pack(anchor="w", pady=(0, 2))
 
     def _add_labeled_entry(self, parent: tk.Widget, label: str, variable: tk.StringVar) -> None:
         row = tk.Frame(parent, bg="#f8f5ee")
@@ -318,7 +333,7 @@ class DashboardWindow:
 
         columns = ("asset", "opened", "strategy", "direction", "result", "amount", "pnl", "payout")
         self._history_tree = ttk.Treeview(frame, columns=columns, show="headings", height=16)
-        for key, title, width, anchor in (("asset", "Pair", 90, "w"), ("opened", "Opened", 180, "w"), ("strategy", "Strategy", 140, "w"), ("direction", "Direction", 80, "center"), ("result", "Result", 90, "center"), ("amount", "Amount", 80, "e"), ("pnl", "P/L", 80, "e"), ("payout", "Payout", 80, "e")):
+        for key, title, width, anchor in (("asset", "Pair", 90, "w"), ("opened", "Opened", 180, "w"), ("strategy", "Strategy", 240, "w"), ("direction", "Direction", 80, "center"), ("result", "Result", 90, "center"), ("amount", "Amount", 80, "e"), ("pnl", "P/L", 80, "e"), ("payout", "Payout", 80, "e")):
             self._history_tree.heading(key, text=title)
             self._history_tree.column(key, width=width, anchor=anchor)
         self._history_tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
@@ -457,7 +472,7 @@ class DashboardWindow:
             run_config = SessionRunConfig(
                 assets=self._read_run_assets(),
                 batch_size=_parse_batch_size(self._batch_size_var.get()),
-                strategy_profiles=self._read_strategy_profiles(require_selection=True),
+                strategy_ids=self._read_strategy_ids(require_selection=True),
                 stake_amount=float(self._stake_var.get()),
                 timeframe_sec=int(self._timeframe_var.get()),
                 expiry_sec=int(self._expiry_var.get()),
@@ -530,7 +545,7 @@ class DashboardWindow:
     def _handle_strategy_selection_change(self) -> None:
         if any(variable.get() for variable in self._strategy_vars.values()):
             return
-        self._strategy_vars["MEDIUM"].set(True)
+        self._strategy_vars[DEFAULT_STRATEGY_ID].set(True)
 
     def _on_login_mode_changed(self, *_args) -> None:
         self._sync_button_visibility()
@@ -623,7 +638,8 @@ class DashboardWindow:
                 "timeframe_sec": self._timeframe_var.get(),
                 "expiry_sec": self._expiry_var.get(),
                 "poll_sec": self._poll_var.get(),
-                "strategy_profiles": format_strategy_profiles(self._read_strategy_profiles(require_selection=True)),
+                "strategy_ids": format_strategy_ids(self._read_strategy_ids(require_selection=True)),
+                "strategy_profiles": ",".join(strategy_profiles_from_ids(self._read_strategy_ids(require_selection=True))),
                 "selected_assets": ",".join(self._selected_assets),
                 "target_mode": self._target_mode_var.get(),
                 "batch_size": self._batch_size_var.get(),
@@ -694,11 +710,11 @@ class DashboardWindow:
             raise ValueError("No supported OTC pairs are currently available.")
         return assets
 
-    def _read_strategy_profiles(self, *, require_selection: bool) -> tuple[str, ...]:
-        selected = tuple(profile for profile, variable in self._strategy_vars.items() if variable.get())
+    def _read_strategy_ids(self, *, require_selection: bool) -> tuple[str, ...]:
+        selected = tuple(strategy_id for strategy_id, variable in self._strategy_vars.items() if variable.get())
         if require_selection and not selected:
-            raise ValueError("Select at least one strategy profile.")
-        return normalize_strategy_profiles(selected)
+            raise ValueError("Select at least one strategy.")
+        return normalize_strategy_ids(selected)
 
     def _render_metric_cards(self, parent: tk.Widget, state: dict[str, tk.StringVar], cards: list[MetricCard]) -> None:
         card_labels = [card.label for card in cards]
@@ -721,10 +737,23 @@ class DashboardWindow:
         self._render_history_rows(snapshot.recent_trades)
 
     def _render_history_rows(self, trades) -> None:
-        for row_id in self._history_tree.get_children():
-            self._history_tree.delete(row_id)
-        for trade in trades:
-            self._history_tree.insert("", tk.END, values=(trade.asset, trade.opened_at_utc.replace("T", " ")[:19], trade.strategy_display, trade.direction.upper(), trade.result, f"{trade.amount:.2f}", _format_money(trade.profit_loss_abs), _format_pct(trade.payout_snapshot)))
+        rows = [
+            (
+                trade.trade_id,
+                (
+                    trade.asset,
+                    trade.opened_at_utc.replace("T", " ")[:19],
+                    trade.strategy_display,
+                    trade.direction.upper(),
+                    trade.result,
+                    f"{trade.amount:.2f}",
+                    _format_money(trade.profit_loss_abs),
+                    _format_pct(trade.payout_snapshot),
+                ),
+            )
+            for trade in trades
+        ]
+        self._sync_tree_rows(self._history_tree, rows, self._history_render_cache)
 
     def open_analytics_window(self) -> None:
         if self._analytics_window is not None and self._analytics_window.winfo_exists():
@@ -750,7 +779,7 @@ class DashboardWindow:
         tk.Label(frame, text=title, bg="#f8f5ee", fg="#1f2a1f", font=("Segoe UI Semibold", 14)).pack(anchor="w", padx=14, pady=(14, 8))
         columns = ("strategy", "group", "trades", "wins", "losses", "win_rate", "net_pnl", "profit_factor")
         tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
-        for key, label, width, anchor in (("strategy", "Strategy", 120, "w"), ("group", "Group", 140, "w"), ("trades", "Trades", 70, "e"), ("wins", "Wins", 70, "e"), ("losses", "Losses", 70, "e"), ("win_rate", "Win Rate", 90, "e"), ("net_pnl", "Net P/L", 90, "e"), ("profit_factor", "Profit Factor", 100, "e")):
+        for key, label, width, anchor in (("strategy", "Strategy", 240, "w"), ("group", "Group", 140, "w"), ("trades", "Trades", 70, "e"), ("wins", "Wins", 70, "e"), ("losses", "Losses", 70, "e"), ("win_rate", "Win Rate", 90, "e"), ("net_pnl", "Net P/L", 90, "e"), ("profit_factor", "Profit Factor", 100, "e")):
             tree.heading(key, text=label)
             tree.column(key, width=width, anchor=anchor)
         tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
@@ -766,13 +795,11 @@ class DashboardWindow:
             self._render_analytics_rows(self._analytics_session_tree, analytics.by_session)
 
     def _render_analytics_rows(self, tree: ttk.Treeview, rows) -> None:
-        for row_id in tree.get_children():
-            tree.delete(row_id)
-        for row in rows:
-            tree.insert(
-                "",
-                tk.END,
-                values=(
+        cache = self._analytics_asset_render_cache if tree is self._analytics_asset_tree else self._analytics_session_render_cache
+        tree_rows = [
+            (
+                f"{row.strategy_display}|{row.group_value}",
+                (
                     row.strategy_display,
                     row.group_value,
                     row.trades,
@@ -783,6 +810,9 @@ class DashboardWindow:
                     f"{row.profit_factor:.2f}",
                 ),
             )
+            for row in rows
+        ]
+        self._sync_tree_rows(tree, tree_rows, cache)
 
     def _close_analytics_window(self) -> None:
         if self._analytics_window is not None and self._analytics_window.winfo_exists():
@@ -790,6 +820,8 @@ class DashboardWindow:
         self._analytics_window = None
         self._analytics_asset_tree = None
         self._analytics_session_tree = None
+        self._analytics_asset_render_cache.clear()
+        self._analytics_session_render_cache.clear()
 
     def open_pair_selector_window(self) -> None:
         if self._latest_snapshot is None:
@@ -826,6 +858,7 @@ class DashboardWindow:
 
         self._pair_selector_frame = tk.Frame(canvas, bg="#f8f5ee")
         canvas.create_window((0, 0), window=self._pair_selector_frame, anchor="nw")
+        self._pair_selector_frame.grid_columnconfigure(0, weight=1)
         self._pair_selector_frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
         self._render_pair_selector_rows()
 
@@ -834,10 +867,10 @@ class DashboardWindow:
         if snapshot is None or self._pair_selector_frame is None:
             return
         rendered_assets: set[str] = set()
-        for pair in snapshot.binary_pairs:
+        for index, pair in enumerate(snapshot.binary_pairs):
             rendered_assets.add(pair.asset)
             is_selected = pair.asset in snapshot.selected_assets
-            self._upsert_pair_row(pair=pair, is_selected=is_selected)
+            self._upsert_pair_row(pair=pair, is_selected=is_selected, row_index=index)
 
         for asset in tuple(self._pair_rows):
             if asset in rendered_assets:
@@ -850,7 +883,7 @@ class DashboardWindow:
             self._pair_chance_labels.pop(asset, None)
             self._pair_render_cache.pop(asset, None)
 
-    def _upsert_pair_row(self, *, pair, is_selected: bool) -> None:
+    def _upsert_pair_row(self, *, pair, is_selected: bool, row_index: int) -> None:
         if self._pair_selector_frame is None:
             return
         render_key = _pair_render_key(pair)
@@ -879,6 +912,7 @@ class DashboardWindow:
             self._pair_chance_labels[pair.asset] = chance_label
             self._pair_labels[pair.asset] = checkbox
             self._pair_render_cache[pair.asset] = ()
+            row.grid(column=0, sticky="ew", padx=12, pady=4)
         if var.get() != is_selected:
             var.set(is_selected)
 
@@ -897,8 +931,7 @@ class DashboardWindow:
             )
             self._pair_render_cache[pair.asset] = render_key
 
-        row.pack_forget()
-        row.pack(fill=tk.X, anchor="w", padx=12, pady=4)
+        row.grid_configure(row=row_index)
 
     def select_all_pairs(self) -> None:
         supported_assets = {
@@ -933,14 +966,10 @@ class DashboardWindow:
         self._pair_selector_frame = None
 
     def _render_open_positions_rows(self, open_positions: tuple[OpenPositionRow, ...]) -> None:
-        for row_id in self._open_positions_tree.get_children():
-            self._open_positions_tree.delete(row_id)
-        for position in open_positions:
-            self._open_positions_tree.insert(
-                "",
-                tk.END,
-                iid=position.trade_id,
-                values=(
+        rows = [
+            (
+                position.trade_id,
+                (
                     position.asset,
                     position.opened_at_utc.replace("T", " ")[:19],
                     _format_age(position.age_sec),
@@ -949,6 +978,33 @@ class DashboardWindow:
                     position.broker_reference or "-",
                 ),
             )
+            for position in open_positions
+        ]
+        self._sync_tree_rows(self._open_positions_tree, rows, self._open_positions_render_cache)
+
+    def _sync_tree_rows(
+        self,
+        tree: ttk.Treeview,
+        rows: list[tuple[str, tuple[object, ...]]],
+        cache: dict[str, tuple[object, ...]],
+    ) -> None:
+        expected_ids = [row_id for row_id, _values in rows]
+        expected_id_set = set(expected_ids)
+        for row_id in tuple(tree.get_children()):
+            if row_id in expected_id_set:
+                continue
+            tree.delete(row_id)
+            cache.pop(row_id, None)
+
+        for index, (row_id, values) in enumerate(rows):
+            if tree.exists(row_id):
+                if cache.get(row_id) != values:
+                    tree.item(row_id, values=values)
+            else:
+                tree.insert("", tk.END, iid=row_id, values=values)
+            if tree.index(row_id) != index:
+                tree.move(row_id, "", index)
+            cache[row_id] = values
 
 
 def _summary_cards(metrics) -> list[MetricCard]:
@@ -1092,12 +1148,20 @@ def save_username_preference(prefs_path: Path, username: str) -> None:
     save_dashboard_preferences(prefs_path, {"last_username": username})
 
 
-def _load_strategy_profiles(preferences: dict[str, str]) -> tuple[str, ...]:
+def _load_strategy_ids(preferences: dict[str, str]) -> tuple[str, ...]:
+    stored_ids = preferences.get("strategy_ids")
+    if stored_ids:
+        return normalize_strategy_ids(stored_ids)
+
     stored_profiles = preferences.get("strategy_profiles")
     if stored_profiles:
-        return normalize_strategy_profiles(stored_profiles)
-    legacy_profile = preferences.get("strategy_profile", "MEDIUM")
-    return normalize_strategy_profiles((legacy_profile,))
+        return normalize_strategy_ids(stored_profiles)
+
+    legacy_profile = preferences.get("strategy_profile")
+    if legacy_profile:
+        return normalize_strategy_ids((legacy_profile,))
+
+    return (DEFAULT_STRATEGY_ID,)
 
 
 def _load_selected_assets(preferences: dict[str, str]) -> tuple[str, ...]:

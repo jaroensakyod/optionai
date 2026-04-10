@@ -9,8 +9,8 @@ It is structured so signal logic, broker execution, analytics, and session contr
 - Practice-first runtime with guarded broker integration
 - Desktop dashboard for bounded sessions and pair selection
 - SQLite trade journal as the source of truth for analytics
-- Profile-based signal engine with layered market filters
-- Regression-tested codebase with `92 passed` locally
+- Strategy catalog with momentum, trend-pullback, and mean-reversion engines
+- Regression-tested codebase with focused dashboard and signal-engine coverage
 
 ## Current Feature Set
 
@@ -19,19 +19,31 @@ It is structured so signal logic, broker execution, analytics, and session contr
 - One-shot and scheduled cycle execution
 - Duplicate-signal protection, stale-data checks, reconnect backoff, and kill switch support
 - IQ Option practice smoke-test and order-probe paths
+- Binary result polling from multiple broker data paths, including async order state
+- Detailed no-signal and session-error reasons written to the runtime event log
 
 ### Strategy layer
 
-- `LOW`, `MEDIUM`, and `HIGH` strategy profiles
-- EMA trend, ADX, ATR, support/resistance distance, and multi-timeframe alignment filters
+- Momentum-first `LOW`, `MEDIUM`, and `HIGH` defaults with explicit `momentum.*`, `trend-pullback.*`, and `mean-reversion.*` strategy IDs
+- Composite multi-strategy selection with conflict handling and per-strategy tagging
+- Momentum diagnostics that explain whether a setup failed at pattern, EMA alignment, ADX, ATR, support/resistance, or higher-timeframe alignment
+- EMA trend, ADX, ATR, support/resistance distance, and multi-timeframe alignment filters across the supported strategy families
 - Strategy-aware signal filtering before broker submission
 
 ### Dashboard and analytics
 
 - Desktop dashboard for practice sessions
-- Supported OTC pair selection and strategy profile control
-- Recent trade history, session logs, open positions, and grouped analytics
+- Supported OTC pair selection and explicit strategy-family control from the UI
+- Rotating asset batches per scan window to reduce mass entry-window skips on large selections
+- Recent trade history, session logs, open positions, and grouped analytics with strategy-aware labels
 - Binary history and runtime-event clearing tools
+
+## Recent Runtime Updates
+
+- Restored momentum as the default strategy family while preserving direct access to trend-pullback and mean-reversion engines
+- Added richer session logging so dashboard errors surface as `ErrorType: message` instead of only the exception class
+- Improved composite-strategy conflict handling to avoid runtime attribute errors during mixed-strategy sessions
+- Reduced redundant dashboard trade scans and improved strategy display formatting in history and analytics views
 
 ## Tech Stack
 

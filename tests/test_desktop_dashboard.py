@@ -2,7 +2,8 @@ from pathlib import Path
 
 from datetime import UTC, datetime
 
-from src.bot.desktop_dashboard import _chance_band_colors, _format_age, _format_clock, _format_updated_at, _load_selected_assets, _load_strategy_profiles, _pair_display_text, _pair_render_key, _parse_batch_size, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
+from src.bot.desktop_dashboard import _chance_band_colors, _format_age, _format_clock, _format_updated_at, _load_selected_assets, _load_strategy_ids, _pair_display_text, _pair_render_key, _parse_batch_size, load_dashboard_preferences, load_saved_username, save_dashboard_preferences, save_username_preference
+from src.bot.signal_engine import DEFAULT_STRATEGY_ID, STRATEGY_ID_ORDER, format_strategy_option_label
 from src.bot.iqoption_dashboard import BinaryPairStatus
 
 
@@ -23,7 +24,7 @@ def test_dashboard_preferences_round_trip(tmp_path: Path) -> None:
             "last_username": "user@example.com",
             "login_account_mode": "REAL",
             "stake_amount": "2.5",
-            "strategy_profiles": "LOW,HIGH",
+            "strategy_ids": "trend-pullback.low,trend-pullback.high",
             "timeframe_sec": "120",
             "batch_size": "ALL",
             "target_mode": "%",
@@ -34,16 +35,37 @@ def test_dashboard_preferences_round_trip(tmp_path: Path) -> None:
         "last_username": "user@example.com",
         "login_account_mode": "REAL",
         "stake_amount": "2.5",
-        "strategy_profiles": "LOW,HIGH",
+        "strategy_ids": "trend-pullback.low,trend-pullback.high",
         "timeframe_sec": "120",
         "batch_size": "ALL",
         "target_mode": "%",
     }
 
 
-def test_load_strategy_profiles_supports_legacy_and_csv_values() -> None:
-    assert _load_strategy_profiles({"strategy_profiles": "LOW,HIGH"}) == ("LOW", "HIGH")
-    assert _load_strategy_profiles({"strategy_profile": "MEDIUM"}) == ("MEDIUM",)
+def test_load_strategy_ids_supports_new_and_legacy_values() -> None:
+    assert _load_strategy_ids({"strategy_ids": "trend-pullback.low,trend-pullback.high"}) == ("trend-pullback.low", "trend-pullback.high")
+    assert _load_strategy_ids({"strategy_profiles": "LOW,HIGH"}) == ("momentum.low", "momentum.high")
+    assert _load_strategy_ids({"strategy_profile": "MEDIUM"}) == ("momentum.medium",)
+    assert _load_strategy_ids({}) == (DEFAULT_STRATEGY_ID,)
+
+
+def test_strategy_option_labels_show_profile_and_engine_name() -> None:
+    assert STRATEGY_ID_ORDER == (
+        "momentum.low",
+        "momentum.medium",
+        "momentum.high",
+        "trend-pullback.low",
+        "trend-pullback.medium",
+        "trend-pullback.high",
+        "mean-reversion.low",
+        "mean-reversion.medium",
+        "mean-reversion.high",
+    )
+    assert format_strategy_option_label("momentum.low") == "Momentum LOW / simple-momentum"
+    assert format_strategy_option_label("momentum.medium") == "Momentum MEDIUM / blitz-momentum"
+    assert format_strategy_option_label("momentum.high") == "Momentum HIGH / relaxed-momentum"
+    assert format_strategy_option_label("trend-pullback.high") == "Trend Pullback HIGH / aggressive-ema-pullback"
+    assert format_strategy_option_label("mean-reversion.high") == "Mean Reversion HIGH / bollinger-rsi-reversion"
 
 
 def test_load_selected_assets_parses_csv_value() -> None:
