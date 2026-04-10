@@ -304,12 +304,15 @@ def _build_repository(tmp_path: Path) -> TradeJournalRepository:
 
 def _build_fresh_csv_provider(tmp_path: Path) -> CsvMarketDataProvider:
     csv_path = tmp_path / "candles.csv"
-    base_time = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=2)
-    csv_path.write_text(
-        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price\n"
-        f"{base_time.isoformat()},EURUSD,digital,60,1.1000,1.1010,1.0995,1.1008\n"
-        f"{(base_time + timedelta(minutes=1)).isoformat()},EURUSD,digital,60,1.1008,1.1020,1.1006,1.1017\n"
-        f"{(base_time + timedelta(minutes=2)).isoformat()},EURUSD,digital,60,1.1017,1.1030,1.1015,1.1026\n",
-        encoding="utf-8",
-    )
+    base_time = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=11)
+    rows = ["opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price"]
+    open_price = 1.1000
+    for minute in range(12):
+        opened_at = (base_time + timedelta(minutes=minute)).isoformat()
+        high_price = open_price + 0.00065
+        low_price = open_price - 0.00015
+        close_price = open_price + 0.00050
+        rows.append(f"{opened_at},EURUSD,digital,60,{open_price:.4f},{high_price:.4f},{low_price:.4f},{close_price:.4f}")
+        open_price += 0.0004
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return CsvMarketDataProvider(csv_path)

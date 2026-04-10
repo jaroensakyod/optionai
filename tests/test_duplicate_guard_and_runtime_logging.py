@@ -265,13 +265,16 @@ def _build_repository(tmp_path: Path) -> TradeJournalRepository:
 
 def _write_candles(tmp_path: Path) -> Path:
     csv_path = tmp_path / "candles.csv"
-    csv_path.write_text(
-        "opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price\n"
-        "2026-04-09T08:00:00+00:00,EURUSD,digital,60,1.1000,1.1010,1.0995,1.1008\n"
-        "2026-04-09T08:01:00+00:00,EURUSD,digital,60,1.1008,1.1020,1.1006,1.1017\n"
-        "2026-04-09T08:02:00+00:00,EURUSD,digital,60,1.1017,1.1030,1.1015,1.1026\n",
-        encoding="utf-8",
-    )
+    rows = ["opened_at_utc,asset,instrument_type,timeframe_sec,open_price,high_price,low_price,close_price"]
+    open_price = 1.1000
+    for minute in range(12):
+        opened_at = f"2026-04-09T08:{minute:02d}:00+00:00"
+        high_price = open_price + 0.00065
+        low_price = open_price - 0.00015
+        close_price = open_price + 0.00050
+        rows.append(f"{opened_at},EURUSD,digital,60,{open_price:.4f},{high_price:.4f},{low_price:.4f},{close_price:.4f}")
+        open_price += 0.0004
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return csv_path
 
 
